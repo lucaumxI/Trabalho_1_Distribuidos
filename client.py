@@ -1,3 +1,34 @@
+"""
+client.py — Cliente de videoconferência (Fase 1).
+
+Status dos requisitos cobertos neste arquivo:
+  [PARCIAL] RF01: login via ID simples (input) — falta validar unicidade e
+            registrar no broker.
+  [TODO]    RF02: presença (quem está online). Requer canal de controle com
+            broker e lista de peers ativos.
+  [PARCIAL] RF03: SALA atualmente hardcoded ("SALA_A"). Falta lógica de
+            entrada/saída de salas e prefixo SALA nos sends de vídeo/áudio
+            (hoje sem filtragem por grupo).
+  [PARCIAL] RF04: captura feita (capturaImagemeAudio); envio e recepção
+            incompletos (pubPacotes não envia vídeo/áudio; subPacotes vazio).
+  [DONE]    RF05: canais separados (sockets distintos por mídia).
+  [TODO]    RF06: IPs 127.0.0.1 hardcoded em pubPacotes — viola requisito.
+  [TODO]    RF07: integração com service discovery (ainda não existe).
+  [TODO]    RF08: seleção de broker (round-robin / menor latência).
+
+  [TODO]    RNF01: retry de texto não implementado.
+  [DONE]    RNF02: áudio em PUB/SUB (baixa latência).
+  [PARCIAL] RNF03: drop de frames delegado ao broker (HWM); falta taxa
+            adaptativa no cliente.
+  [DONE]    RNF04: uso de threads para async.
+  [PARCIAL] RNF05: (1) Captura DONE (2 sub-threads), (2) Envio DONE,
+            (3) Recepção thread criada mas função vazia, (4) Renderização
+            apenas placeholder.
+  [DONE]    RNF06/RNF07: Python 3 + ZeroMQ.
+
+  [TODO]    ARQ04/ARQ05/ARQ06: heartbeat, timeouts e failover.
+"""
+
 import zmq
 import threading
 import queue
@@ -82,6 +113,7 @@ def _captura_audio(fila_audio, parar_evento):
         pa.terminate()
 
 
+# [DONE] RNF05.1 (Captura) — webcam + microfone em sub-threads dedicadas.
 def capturaImagemeAudio(contexto, fila_video, fila_audio, parar_evento=None):
     if parar_evento is None:
         parar_evento = threading.Event()
@@ -109,11 +141,17 @@ def capturaImagemeAudio(contexto, fila_video, fila_audio, parar_evento=None):
     t_video.join(timeout=2)
     t_audio.join(timeout=2)
 
+# [TODO] RNF05.4 (Renderização) — montar GUI que consome as filas _sub.
+# [TODO] RNF08: interface desktop (Tkinter / PyQt / OpenCV imshow).
 def renderizacaoInterface(contexto): # não sei o que vai receber de argumentos, provavelmente essa vai ser a última a ser implementada e o texto creio eu que vai ser capturado aqui
     #implementação
     print("INTERFACE RENDERIZADA")
 
+# [PARCIAL] RNF05.2 (Envio) — thread existe e envia texto; vídeo/áudio ainda
+# não são enviados (frames pegos da fila e descartados com `pass`).
 def pubPacotes(contexto, fila_video, fila_audio, fila_texto, ID, SALA):
+    # [TODO] RF06: substituir IPs hardcoded por endpoints obtidos do service discovery.
+    # [TODO] RF08: implementar seleção de broker (round-robin ou menor latência).
     video_pub = contexto.socket(zmq.PUB)
     video_pub.connect("tcp://127.0.0.1:5555")   # todo: RF06
 
@@ -128,7 +166,9 @@ def pubPacotes(contexto, fila_video, fila_audio, fila_texto, ID, SALA):
     print("Cliente PUB Iniciado")
 
     while True:
-        # Tenta pegar um frame de vídeo da fila por 10 milissegundos
+        # [TODO] RF04: frame agora JÁ chega como bytes JPEG da fila (capturaImagemeAudio).
+        # Basta: video_pub.send_multipart([SALA.encode(), ID.encode(), frame])
+        # [TODO] RF03: prefixar com SALA para permitir filtragem por grupo nos SUBs.
         try:
             frame = fila_video.get(timeout=0.01)
             # Se usar OpenCV vai chegar uma matriz numpy, precisa converter para bytes puros antes de usar a função debaixo
@@ -137,7 +177,8 @@ def pubPacotes(contexto, fila_video, fila_audio, fila_texto, ID, SALA):
         except queue.Empty:
             pass # Fila estava vazia, segue o jogo
 
-        # Tenta pegar um pacote de áudio
+        # [TODO] RF04: audio também já chega em bytes puros (PyAudio paInt16).
+        # audio_pub.send_multipart([SALA.encode(), ID.encode(), audio])
         try:
             audio = fila_audio.get(timeout=0.01)
             # se usar o PyAudio, se eu não me engano ja vem em byter puros, aí é só descomentar a linha debaixo que ja da certo
@@ -147,7 +188,8 @@ def pubPacotes(contexto, fila_video, fila_audio, fila_texto, ID, SALA):
         except queue.Empty:
             pass
 
-        # Tenta pegar um texto digitado
+        # [DONE] RF04 (texto)
+        # [TODO] RNF01: adicionar política de retry (ACK + reenvio) para chat.
         try:
             texto = fila_texto.get(timeout=0.01)
             # Se for texto, envia como string com a tag do remetente
@@ -155,12 +197,19 @@ def pubPacotes(contexto, fila_video, fila_audio, fila_texto, ID, SALA):
         except queue.Empty:
             pass
 
+# [TODO] RNF05.3 (Recepção) — implementar.
+# Deve conectar em: XPUB vídeo (5556), XPUB áudio (5558), DEALER texto (5560)
+# e preencher as filas _sub para a thread de renderização consumir.
+# [TODO] RF03: setsockopt(zmq.SUBSCRIBE, SALA) para filtrar pelo grupo do usuário.
 def subPacotes(contexto, fila_video, fila_audio, fila_texto, SALA):
     print("Pacotes recebidos")
 
 
 def main():
+    # [PARCIAL] RF01: ID lido do usuário, falta registrar no broker e garantir unicidade.
+    # [TODO] RF02: enviar PRESENÇA (online) ao entrar e LEAVE ao sair.
     ID = input("Digite seu ID: ")   # Todo: RF01
+    # [PARCIAL] RF03: SALA fixa. Permitir entrada/saída dinâmica em Grupos A–K.
     SALA = "SALA_A"                 # Todo: RF03
 
     contexto = zmq.Context()

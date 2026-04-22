@@ -1,7 +1,29 @@
+"""
+broker.py — Roteador central (Fase 1) do sistema de videoconferência.
+
+Status dos requisitos cobertos neste arquivo:
+  [DONE]    RF04 (parte servidor): recebe/repassa Vídeo, Áudio e Texto.
+  [DONE]    RF05: canais separados e unidirecionais (3 portas por mídia).
+  [DONE]    RNF02: áudio em PUB/SUB (baixa latência, tolera perda).
+  [PARCIAL] RNF03: drop de frames via HWM no vídeo; falta taxa adaptativa.
+  [DONE]    RNF04: threads para processamento assíncrono (3 roteadores).
+  [DONE]    RNF06/RNF07: Python 3 + ZeroMQ.
+
+  [TODO]    RNF01: entrega garantida de texto — ROUTER/DEALER com zmq.proxy
+            faz load-balancing (1 destinatário), não fan-out. Para chat em sala
+            precisa de broker customizado OU trocar para PUB/SUB + retry.
+  [TODO]    ARQ01/ARQ02/ARQ03: cluster de N brokers + roteamento inter-brokers
+            (XPUB/XSUB cross-broker) sem loops. Hoje há só 1 broker.
+  [TODO]    ARQ04: heartbeat (PING/PONG com clientes).
+  [TODO]    ARQ05: timeouts para detectar queda de broker vizinho.
+  [TODO]    RF07: endpoint de registro dinâmico (ou arquivo discovery separado).
+"""
+
 import zmq
 import threading
 
-def roteador_video(context):    # Thread para roteador de vídeo
+def roteador_video(context):    # [DONE] RF05/RNF03: canal de vídeo unidirecional com drop de frames
+    # Thread para roteador de vídeo
     # Cria um socket do tipo Extended Sub, ele irá receber os pacotes de todos os clientes e atua de froma bidirecional repassando flags de controle
     # para o PUB dos clientes
     frontend = context.socket(zmq.XSUB) 
@@ -20,7 +42,9 @@ def roteador_video(context):    # Thread para roteador de vídeo
     # porque com eles é possível ter um controle de quem nesse momento está requisitando os dados evitando que um client A fique enviando seus pacotes para o broker sem ter alguem
     # requisitando esses pacotes
 
-def roteador_audio(context):    # Thread para roteador de audio, bem semelhante a de vídeo porém sem o drop de frames
+def roteador_audio(context):    # [DONE] RF05/RNF02: canal de áudio unidirecional, baixa latência
+    # Thread para roteador de audio, bem semelhante a de vídeo porém sem o drop de frames
+    # [TODO] RNF02: considerar setar HWM também no áudio por consistência (não crítico)
     frontend = context.socket(zmq.XSUB)
     frontend.bind("tcp://*:5557")
 
@@ -30,9 +54,13 @@ def roteador_audio(context):    # Thread para roteador de audio, bem semelhante 
     print("Canal de ÁUDIO (XPUB/XSUB) nas portas 5557 e 5558")
     zmq.proxy(frontend, backend)
 
-def roteador_texto(context):    # Roteador de texto
+def roteador_texto(context):    # [PARCIAL] RF05 canal unidirecional ok; RNF01 incompleto (ver abaixo)
     # ROUTER/DEALER garantem que mensagens de texto não sejam descartadas
     # caso um cliente pisque na rede.
+    # [TODO] RNF01: zmq.proxy(ROUTER, DEALER) faz load-balancing (entrega a
+    # apenas 1 cliente), não fan-out por sala. Para chat de grupo (RF03),
+    # trocar para PUB/SUB com tópico=SALA + retry no cliente, OU escrever
+    # broker customizado que itere sobre identidades ROUTER por sala.
     frontend = context.socket(zmq.ROUTER)   # Cria um socket do tipo ROUTER
     frontend.bind("tcp://*:5559")           # Atribui a porta 5559 a ele
 
