@@ -60,7 +60,7 @@ def subPacotes(contexto, fila_video, fila_audio, fila_texto, SALA):
 
 
 def main():
-    ID = input("Digite seu ID: ")   # Todo: RF06
+    ID = input("Digite seu ID: ")   # Todo: RF01
     SALA = "SALA_A"                 # Todo: RF03
 
     contexto = zmq.Context()
