@@ -20,7 +20,9 @@ AUDIO_CHUNK = 1024
 
 
 def _captura_video(fila_video, parar_evento):
-    cap = cv2.VideoCapture(0)
+    import sys
+    backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
+    cap = cv2.VideoCapture(0, backend)
     if not cap.isOpened():
         print("[captura_video] Webcam indisponível.")
         return
