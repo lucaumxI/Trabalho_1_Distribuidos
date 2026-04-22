@@ -2,12 +2,110 @@ import zmq
 import threading
 import queue
 import time
+import cv2
+import pyaudio
 
 global ID
 
-def capturaImagemeAudio(contexto, fila_video, fila_audio):
-    #implementação da thread para capturar audio do microfone e frames da webcam
+# Parâmetros de captura (defaults)
+VIDEO_WIDTH = 640
+VIDEO_HEIGHT = 480
+VIDEO_FPS = 30
+VIDEO_JPEG_QUALITY = 70
+
+AUDIO_RATE = 16000
+AUDIO_CHANNELS = 1
+AUDIO_FORMAT = pyaudio.paInt16
+AUDIO_CHUNK = 1024
+
+
+def _captura_video(fila_video, parar_evento):
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("[captura_video] Webcam indisponível.")
+        return
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, VIDEO_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, VIDEO_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS, VIDEO_FPS)
+
+    intervalo = 1.0 / VIDEO_FPS
+    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), VIDEO_JPEG_QUALITY]
+
+    try:
+        while not parar_evento.is_set():
+            inicio = time.time()
+            ok, frame = cap.read()
+            if not ok:
+                time.sleep(intervalo)
+                continue
+
+            ok, buffer = cv2.imencode(".jpg", frame, encode_params)
+            if ok:
+                fila_video.put(buffer.tobytes())
+
+            dt = time.time() - inicio
+            if dt < intervalo:
+                time.sleep(intervalo - dt)
+    finally:
+        cap.release()
+
+
+def _captura_audio(fila_audio, parar_evento):
+    pa = pyaudio.PyAudio()
+    try:
+        stream = pa.open(
+            format=AUDIO_FORMAT,
+            channels=AUDIO_CHANNELS,
+            rate=AUDIO_RATE,
+            input=True,
+            frames_per_buffer=AUDIO_CHUNK,
+        )
+    except Exception as e:
+        print(f"[captura_audio] Microfone indisponível: {e}")
+        pa.terminate()
+        return
+
+    try:
+        while not parar_evento.is_set():
+            try:
+                dados = stream.read(AUDIO_CHUNK, exception_on_overflow=False)
+                fila_audio.put(dados)
+            except Exception as e:
+                print(f"[captura_audio] Erro na leitura: {e}")
+                break
+    finally:
+        stream.stop_stream()
+        stream.close()
+        pa.terminate()
+
+
+def capturaImagemeAudio(contexto, fila_video, fila_audio, parar_evento=None):
+    if parar_evento is None:
+        parar_evento = threading.Event()
+
+    t_video = threading.Thread(
+        target=_captura_video, args=(fila_video, parar_evento), daemon=True
+    )
+    t_audio = threading.Thread(
+        target=_captura_audio, args=(fila_audio, parar_evento), daemon=True
+    )
+
+    t_video.start()
+    t_audio.start()
+
     print("IMAGEM E AUDIO CAPTURADOS")
+
+    try:
+        while not parar_evento.is_set():
+            if not t_video.is_alive() and not t_audio.is_alive():
+                break
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        parar_evento.set()
+
+    t_video.join(timeout=2)
+    t_audio.join(timeout=2)
 
 def renderizacaoInterface(contexto): # não sei o que vai receber de argumentos, provavelmente essa vai ser a última a ser implementada e o texto creio eu que vai ser capturado aqui
     #implementação
@@ -75,18 +173,26 @@ def main():
     fila_audio_sub = queue.Queue()
     fila_texto_sub = queue.Queue()
 
-    # Passando ID e SALA corretamente como argumentos
+    parar_evento = threading.Event()
+
+    t_captura = threading.Thread(
+        target=capturaImagemeAudio,
+        args=(contexto, fila_video_pub, fila_audio_pub, parar_evento),
+    )
     t_envio = threading.Thread(target=pubPacotes, args=(contexto, fila_video_pub, fila_audio_pub, fila_texto_pub, ID, SALA))
     t_recep = threading.Thread(target=subPacotes, args=(contexto, fila_video_sub, fila_audio_sub, fila_texto_sub, SALA))
 
+    t_captura.start()
     t_envio.start()
     t_recep.start()
 
     try:
         t_envio.join()
         t_recep.join()
+        t_captura.join()
     except KeyboardInterrupt:
         print("\nEncerrando o cliente...")
+        parar_evento.set()
 
 if __name__ == "__main__":
     main()
