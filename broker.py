@@ -2,11 +2,14 @@
 broker.py — Roteador central (Fase 1) do sistema de videoconferência.
 
 Status dos requisitos cobertos neste arquivo:
+  [DONE]    RF01: login por ID único (unicidade validada em controle_presenca).
+  [DONE]    RF02: estado de presença + eventos ONLINE/OFFLINE via PUB 5562.
+  [DONE]    RF03: join/leave de salas + broadcast SALA ... JOIN/LEAVE.
   [DONE]    RF04 (parte servidor): recebe/repassa Vídeo, Áudio e Texto.
   [DONE]    RF05: canais separados e unidirecionais (3 portas por mídia).
   [DONE]    RNF02: áudio em PUB/SUB (baixa latência, tolera perda).
   [PARCIAL] RNF03: drop de frames via HWM no vídeo; falta taxa adaptativa.
-  [DONE]    RNF04: threads para processamento assíncrono (3 roteadores).
+  [DONE]    RNF04: threads para processamento assíncrono (4 threads).
   [DONE]    RNF06/RNF07: Python 3 + ZeroMQ.
 
   [TODO]    RNF01: entrega garantida de texto — ROUTER/DEALER com zmq.proxy
@@ -21,6 +24,8 @@ Status dos requisitos cobertos neste arquivo:
 
 import zmq
 import threading
+
+from presenca import EstadoPresenca, handle_cmd, CTRL_PORT, PRESENCE_PORT
 
 def roteador_video(context):    # [DONE] RF05/RNF03: canal de vídeo unidirecional com drop de frames
     # Thread para roteador de vídeo
@@ -78,24 +83,71 @@ def roteador_texto(context):    # [PARCIAL] RF05 canal unidirecional ok; RNF01 i
     # durante o envio/recebimento de um chat, o pacote de texto não é jogado no vácuo; ele fica retido 
     # na fila do ZeroMQ até ser entregue, não havendo perda de informação.
 
+def controle_presenca(context, parar_evento=None, ctrl_port=CTRL_PORT,
+                      presence_port=PRESENCE_PORT, estado=None):
+    # [DONE] RF01/RF02/RF03: serviço de identidade, presença e salas.
+    # ROUTER recebe comandos síncronos (LOGIN/LOGOUT/JOIN/LEAVE/LIST/LIST_SALA)
+    # e PUB publica eventos assíncronos (PRESENCE ONLINE/OFFLINE, SALA JOIN/LEAVE).
+    if estado is None:
+        estado = EstadoPresenca()
+
+    router = context.socket(zmq.ROUTER)
+    router.setsockopt(zmq.LINGER, 0)
+    router.bind(f"tcp://*:{ctrl_port}")
+
+    pub = context.socket(zmq.PUB)
+    pub.setsockopt(zmq.LINGER, 0)
+    pub.bind(f"tcp://*:{presence_port}")
+
+    poller = zmq.Poller()
+    poller.register(router, zmq.POLLIN)
+
+    print(f"Canal de CONTROLE (ROUTER) na porta {ctrl_port} | PRESENÇA (PUB) na porta {presence_port}")
+
+    try:
+        while parar_evento is None or not parar_evento.is_set():
+            socks = dict(poller.poll(200))
+            if router not in socks:
+                continue
+            frames = router.recv_multipart()
+            # REQ envia: [identity, b"", payload]. ROUTER prepende identity.
+            if len(frames) < 3:
+                continue
+            identity, _empty, payload = frames[0], frames[1], frames[2]
+            try:
+                msg = payload.decode("utf-8", errors="replace")
+            except Exception:
+                msg = ""
+            resposta, eventos = handle_cmd(estado, msg)
+            router.send_multipart([identity, b"", resposta.encode("utf-8")])
+            for ev in eventos:
+                pub.send_string(ev)
+    finally:
+        router.close(linger=0)
+        pub.close(linger=0)
+
+
 def main():
     context = zmq.Context() # Inicia o contexto do ZQM
 
-    # Cria as threads do broker para rodar os 3 roteadores em paralelo
-    t_video = threading.Thread(target=roteador_video, args=(context,))
-    t_audio = threading.Thread(target=roteador_audio, args=(context,))
-    t_texto = threading.Thread(target=roteador_texto, args=(context,))
+    # Cria as threads do broker para rodar os roteadores em paralelo
+    t_video = threading.Thread(target=roteador_video, args=(context,), daemon=True)
+    t_audio = threading.Thread(target=roteador_audio, args=(context,), daemon=True)
+    t_texto = threading.Thread(target=roteador_texto, args=(context,), daemon=True)
+    t_ctrl = threading.Thread(target=controle_presenca, args=(context,), daemon=True)
 
     # Inicia as threads
     t_video.start()
     t_audio.start()
     t_texto.start()
+    t_ctrl.start()
 
     try:
         # Mantém a thread principal viva aguardando as outras
         t_video.join()
         t_audio.join()
         t_texto.join()
+        t_ctrl.join()
     except KeyboardInterrupt:
         print("\nDesligando broker central...")
     finally:

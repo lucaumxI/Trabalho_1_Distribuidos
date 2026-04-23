@@ -2,13 +2,13 @@
 client.py — Cliente de videoconferência (Fase 1).
 
 Status dos requisitos cobertos neste arquivo:
-  [PARCIAL] RF01: login via ID simples (input) — falta validar unicidade e
-            registrar no broker.
-  [TODO]    RF02: presença (quem está online). Requer canal de controle com
-            broker e lista de peers ativos.
-  [PARCIAL] RF03: SALA atualmente hardcoded ("SALA_A"). Falta lógica de
-            entrada/saída de salas e prefixo SALA nos sends de vídeo/áudio
-            (hoje sem filtragem por grupo).
+  [DONE]    RF01: login via ID único — validação de unicidade no broker
+            (ClientePresenca.login).
+  [DONE]    RF02: presença — lista LIST + eventos ONLINE/OFFLINE via SUB,
+            mantidos em ClientePresenca.online.
+  [DONE]    RF03: entrada/saída de salas (JOIN/LEAVE) + lista de membros por
+            sala via eventos. Falta ainda prefixar SALA nos sends de mídia
+            (item separado de RF04/RF05).
   [PARCIAL] RF04: captura feita (capturaImagemeAudio); envio e recepção
             incompletos (pubPacotes não envia vídeo/áudio; subPacotes vazio).
   [DONE]    RF05: canais separados (sockets distintos por mídia).
@@ -36,7 +36,12 @@ import time
 import cv2
 import pyaudio
 
+from presenca import ClientePresenca, CTRL_PORT, PRESENCE_PORT
+
 global ID
+
+BROKER_HOST = "127.0.0.1"   # [TODO] RF06: substituir por service discovery.
+SALAS_VALIDAS = [chr(c) for c in range(ord("A"), ord("K") + 1)]  # Grupos A–K
 
 # Parâmetros de captura (defaults)
 VIDEO_WIDTH = 640
@@ -205,14 +210,90 @@ def subPacotes(contexto, fila_video, fila_audio, fila_texto, SALA):
     print("Pacotes recebidos")
 
 
-def main():
-    # [PARCIAL] RF01: ID lido do usuário, falta registrar no broker e garantir unicidade.
-    # [TODO] RF02: enviar PRESENÇA (online) ao entrar e LEAVE ao sair.
-    ID = input("Digite seu ID: ")   # Todo: RF01
-    # [PARCIAL] RF03: SALA fixa. Permitir entrada/saída dinâmica em Grupos A–K.
-    SALA = "SALA_A"                 # Todo: RF03
+def fazer_login(cp: ClientePresenca) -> str:
+    """[DONE] RF01 — pede ID e retenta até o broker aceitar (unicidade)."""
+    while True:
+        ID = input("Digite seu ID: ").strip()
+        if not ID:
+            print("  ID vazio, tente novamente.")
+            continue
+        resp = cp.login(ID)
+        print(f"  broker: {resp}")
+        if resp.startswith("OK"):
+            return ID
 
+
+def escolher_sala(cp: ClientePresenca) -> str:
+    """[DONE] RF03 — escolhe uma das salas A–K e faz JOIN."""
+    print(f"Salas disponíveis: {', '.join(SALAS_VALIDAS)}")
+    while True:
+        sala = input("Entre em uma sala: ").strip().upper()
+        if sala not in SALAS_VALIDAS:
+            print(f"  Sala inválida. Escolha entre {SALAS_VALIDAS}.")
+            continue
+        resp = cp.join(sala)
+        print(f"  broker: {resp}")
+        if resp.startswith("OK"):
+            return sala
+
+
+def menu_controle(cp: ClientePresenca, parar_evento: threading.Event) -> None:
+    """[DONE] RF02/RF03 — loop interativo: listar online, entrar/sair de salas."""
+    ajuda = (
+        "\nComandos: [l] listar online  [s] listar sala  [j <S>] join  "
+        "[x <S>] leave  [q] sair\n"
+    )
+    print(ajuda)
+    try:
+        while not parar_evento.is_set():
+            linha = input("> ").strip()
+            if not linha:
+                continue
+            partes = linha.split()
+            cmd = partes[0].lower()
+            if cmd == "q":
+                break
+            elif cmd == "l":
+                online = cp.list_online()
+                if not online:
+                    print("  (ninguém online)")
+                else:
+                    for uid, salas in sorted(online.items()):
+                        marca = " (você)" if uid == cp.ID else ""
+                        salas_txt = ",".join(salas) if salas else "-"
+                        print(f"  - {uid}{marca}  salas: {salas_txt}")
+            elif cmd == "s":
+                sala = partes[1].upper() if len(partes) > 1 else (
+                    next(iter(cp.salas), "")
+                )
+                if not sala:
+                    print("  uso: s <SALA>")
+                    continue
+                membros = cp.list_sala(sala)
+                print(f"  sala {sala}: {membros or '(vazia)'}")
+            elif cmd == "j" and len(partes) == 2:
+                print(f"  broker: {cp.join(partes[1].upper())}")
+            elif cmd == "x" and len(partes) == 2:
+                print(f"  broker: {cp.leave(partes[1].upper())}")
+            else:
+                print(ajuda)
+    except (EOFError, KeyboardInterrupt):
+        pass
+    finally:
+        parar_evento.set()
+
+
+def main():
     contexto = zmq.Context()
+
+    # [DONE] RF01/RF02/RF03 — serviço de identidade e presença.
+    cp = ClientePresenca(
+        contexto,
+        f"tcp://{BROKER_HOST}:{CTRL_PORT}",
+        f"tcp://{BROKER_HOST}:{PRESENCE_PORT}",
+    )
+    ID = fazer_login(cp)
+    SALA = escolher_sala(cp)
 
     # Filas de Saída (Upload)
     fila_video_pub = queue.Queue()
@@ -229,21 +310,34 @@ def main():
     t_captura = threading.Thread(
         target=capturaImagemeAudio,
         args=(contexto, fila_video_pub, fila_audio_pub, parar_evento),
+        daemon=True,
     )
-    t_envio = threading.Thread(target=pubPacotes, args=(contexto, fila_video_pub, fila_audio_pub, fila_texto_pub, ID, SALA))
-    t_recep = threading.Thread(target=subPacotes, args=(contexto, fila_video_sub, fila_audio_sub, fila_texto_sub, SALA))
+    t_envio = threading.Thread(
+        target=pubPacotes,
+        args=(contexto, fila_video_pub, fila_audio_pub, fila_texto_pub, ID, SALA),
+        daemon=True,
+    )
+    t_recep = threading.Thread(
+        target=subPacotes,
+        args=(contexto, fila_video_sub, fila_audio_sub, fila_texto_sub, SALA),
+        daemon=True,
+    )
 
     t_captura.start()
     t_envio.start()
     t_recep.start()
 
     try:
-        t_envio.join()
-        t_recep.join()
-        t_captura.join()
-    except KeyboardInterrupt:
+        menu_controle(cp, parar_evento)
+    finally:
         print("\nEncerrando o cliente...")
         parar_evento.set()
+        try:
+            print(f"  broker: {cp.logout()}")
+        except Exception as e:
+            print(f"  logout falhou: {e}")
+        cp.close()
+        contexto.term()
 
 if __name__ == "__main__":
     main()
