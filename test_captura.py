@@ -1,5 +1,5 @@
 """
-Testes para capturaImagemeAudio.
+Testes para media_capture.
 
 Rodar unitários (com mocks, sem webcam/mic):
     python -m unittest test_captura.py -v
@@ -16,7 +16,7 @@ from unittest.mock import patch, MagicMock
 
 import numpy as np
 
-import client
+import media_capture
 
 
 class TestCapturaVideo(unittest.TestCase):
@@ -29,9 +29,10 @@ class TestCapturaVideo(unittest.TestCase):
         cap_mock.isOpened.return_value = True
         cap_mock.read.return_value = (True, frame_falso)
 
-        with patch("client.cv2.VideoCapture", return_value=cap_mock):
+        with patch("media_capture.cv2.VideoCapture", return_value=cap_mock):
             t = threading.Thread(
-                target=client._captura_video, args=(fila, parar), daemon=True
+                target=media_capture._captura_video,
+                args=(fila, parar), daemon=True,
             )
             t.start()
             time.sleep(0.3)
@@ -51,8 +52,8 @@ class TestCapturaVideo(unittest.TestCase):
         cap_mock = MagicMock()
         cap_mock.isOpened.return_value = False
 
-        with patch("client.cv2.VideoCapture", return_value=cap_mock):
-            client._captura_video(fila, parar)
+        with patch("media_capture.cv2.VideoCapture", return_value=cap_mock):
+            media_capture._captura_video(fila, parar)
 
         self.assertTrue(fila.empty(), "Fila deve ficar vazia se webcam falhar")
 
@@ -65,9 +66,10 @@ class TestCapturaVideo(unittest.TestCase):
         cap_mock.isOpened.return_value = True
         cap_mock.read.return_value = (True, frame_falso)
 
-        with patch("client.cv2.VideoCapture", return_value=cap_mock):
+        with patch("media_capture.cv2.VideoCapture", return_value=cap_mock):
             t = threading.Thread(
-                target=client._captura_video, args=(fila, parar), daemon=True
+                target=media_capture._captura_video,
+                args=(fila, parar), daemon=True,
             )
             t.start()
             time.sleep(0.1)
@@ -83,14 +85,15 @@ class TestCapturaAudio(unittest.TestCase):
         parar = threading.Event()
 
         stream_mock = MagicMock()
-        stream_mock.read.return_value = b"\x00\x01" * client.AUDIO_CHUNK
+        stream_mock.read.return_value = b"\x00\x01" * media_capture.AUDIO_CHUNK
 
         pa_mock = MagicMock()
         pa_mock.open.return_value = stream_mock
 
-        with patch("client.pyaudio.PyAudio", return_value=pa_mock):
+        with patch("media_capture.pyaudio.PyAudio", return_value=pa_mock):
             t = threading.Thread(
-                target=client._captura_audio, args=(fila, parar), daemon=True
+                target=media_capture._captura_audio,
+                args=(fila, parar), daemon=True,
             )
             t.start()
             time.sleep(0.2)
@@ -110,14 +113,14 @@ class TestCapturaAudio(unittest.TestCase):
         pa_mock = MagicMock()
         pa_mock.open.side_effect = OSError("Sem mic")
 
-        with patch("client.pyaudio.PyAudio", return_value=pa_mock):
-            client._captura_audio(fila, parar)
+        with patch("media_capture.pyaudio.PyAudio", return_value=pa_mock):
+            media_capture._captura_audio(fila, parar)
 
         self.assertTrue(fila.empty(), "Fila deve ficar vazia se mic falhar")
         pa_mock.terminate.assert_called_once()
 
 
-class TestCapturaImagemeAudio(unittest.TestCase):
+class TestCapturaMidia(unittest.TestCase):
     def test_inicia_duas_subthreads(self):
         fila_v = queue.Queue()
         fila_a = queue.Queue()
@@ -133,11 +136,11 @@ class TestCapturaImagemeAudio(unittest.TestCase):
             chamadas["audio"] += 1
             evento.wait(timeout=1)
 
-        with patch("client._captura_video", side_effect=fake_video), \
-             patch("client._captura_audio", side_effect=fake_audio):
+        with patch("media_capture._captura_video", side_effect=fake_video), \
+             patch("media_capture._captura_audio", side_effect=fake_audio):
             t = threading.Thread(
-                target=client.capturaImagemeAudio,
-                args=(None, fila_v, fila_a, parar),
+                target=media_capture.captura_midia,
+                args=(fila_v, fila_a, parar),
                 daemon=True,
             )
             t.start()
@@ -157,8 +160,8 @@ def teste_manual():
     parar = threading.Event()
 
     t = threading.Thread(
-        target=client.capturaImagemeAudio,
-        args=(None, fila_v, fila_a, parar),
+        target=media_capture.captura_midia,
+        args=(fila_v, fila_a, parar),
         daemon=True,
     )
     t.start()

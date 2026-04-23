@@ -1,4 +1,6 @@
 requisitos.md
-readme.md
 __pycache__/
 .venv/
+*.pdf
+*.pyc
+.vscode/

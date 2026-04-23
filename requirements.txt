@@ -1,4 +1,6 @@
-numpy==2.4.4
-opencv-python==4.13.0.92
-PyAudio==0.2.14
-pyzmq==27.1.0
+--index-url https://pypi.org/simple/
+numpy
+opencv-python
+PyAudio
+pyzmq
+Pillow
