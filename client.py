@@ -171,33 +171,20 @@ def pubPacotes(contexto, fila_video, fila_audio, fila_texto, ID, SALA):
     print("Cliente PUB Iniciado")
 
     while True:
-        # [TODO] RF04: frame agora JÁ chega como bytes JPEG da fila (capturaImagemeAudio).
-        # Basta: video_pub.send_multipart([SALA.encode(), ID.encode(), frame])
-        # [TODO] RF03: prefixar com SALA para permitir filtragem por grupo nos SUBs.
         try:
             frame = fila_video.get(timeout=0.01)
-            # Se usar OpenCV vai chegar uma matriz numpy, precisa converter para bytes puros antes de usar a função debaixo
-            # video_pub.send(frame_convertido_em_bytes)
-            pass
+            video_pub.send_multipart([SALA.encode(), ID.encode(), frame])
         except queue.Empty:
             pass # Fila estava vazia, segue o jogo
-
-        # [TODO] RF04: audio também já chega em bytes puros (PyAudio paInt16).
-        # audio_pub.send_multipart([SALA.encode(), ID.encode(), audio])
         try:
             audio = fila_audio.get(timeout=0.01)
-            # se usar o PyAudio, se eu não me engano ja vem em byter puros, aí é só descomentar a linha debaixo que ja da certo
-            # mas caso não seja bytes puros vai ter que converter antes de usar
-            # audio_pub.send(audio_em_bytes)
-            pass
+            audio_pub.send_multipart([SALA.encode(), ID.encode(), audio])
         except queue.Empty:
             pass
 
-        # [DONE] RF04 (texto)
         # [TODO] RNF01: adicionar política de retry (ACK + reenvio) para chat.
         try:
             texto = fila_texto.get(timeout=0.01)
-            # Se for texto, envia como string com a tag do remetente
             texto_dealer.send_string(f"{SALA} {ID} {texto}")
         except queue.Empty:
             pass

@@ -5,13 +5,13 @@ Ferramenta de videoconferência desktop que suporta transmissão de Vídeo, Áud
 
 ## 2. Requisitos Funcionais (RF)
 ### Gestão de Identidade e Sessão
-* **RF01:** O sistema deve permitir o login do usuário através de um ID único simples.
-* **RF02:** O sistema deve controlar e manter o estado de presença dos usuários (quem está online).
-* **RF03:** O sistema deve permitir a entrada e saída de usuários em salas/grupos de comunicação (ex: Grupos A–K).
+* **RF01:** O sistema deve permitir o login do usuário através de um ID único simples. (✅)
+* **RF02:** O sistema deve controlar e manter o estado de presença dos usuários (quem está online). (✅)
+* **RF03:** O sistema deve permitir a entrada e saída de usuários em salas/grupos de comunicação (ex: Grupos A–K). (✅)
 
 ### Transmissão e Interação
-* **RF04:** O sistema deve capturar, enviar e receber Vídeo, Áudio e Texto.
-* **RF05:** Os canais de transmissão para voz, vídeo e texto devem ser separados e unidirecionais.
+* **RF04:** O sistema deve capturar, enviar e receber Vídeo, Áudio e Texto. (✅)
+* **RF05:** Os canais de transmissão para voz, vídeo e texto devem ser separados e unidirecionais. (✅)
 
 ### Descoberta de Serviço (Service Discovery)
 * **RF06:** O cliente não deve possuir IPs de brokers pré-configurados (hardcoded). A descoberta deve ser dinâmica.
