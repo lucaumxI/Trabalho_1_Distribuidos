@@ -9,21 +9,18 @@ Status dos requisitos cobertos neste arquivo:
   [DONE]    RF03: entrada/saída de salas (JOIN/LEAVE) + lista de membros por
             sala via eventos. Falta ainda prefixar SALA nos sends de mídia
             (item separado de RF04/RF05).
-  [PARCIAL] RF04: captura feita (capturaImagemeAudio); envio e recepção
-            incompletos (pubPacotes não envia vídeo/áudio; subPacotes vazio).
+  [DONE]    RF04: captura + envio + recepção de vídeo/áudio/texto.
   [DONE]    RF05: canais separados (sockets distintos por mídia).
-  [TODO]    RF06: IPs 127.0.0.1 hardcoded em pubPacotes — viola requisito.
+  [TODO]    RF06: IPs 127.0.0.1 hardcoded em pubPacotes/subPacotes.
   [TODO]    RF07: integração com service discovery (ainda não existe).
   [TODO]    RF08: seleção de broker (round-robin / menor latência).
 
   [TODO]    RNF01: retry de texto não implementado.
   [DONE]    RNF02: áudio em PUB/SUB (baixa latência).
-  [PARCIAL] RNF03: drop de frames delegado ao broker (HWM); falta taxa
-            adaptativa no cliente.
+  [PARCIAL] RNF03: drop de frames via HWM no PUB/SUB; falta taxa adaptativa.
   [DONE]    RNF04: uso de threads para async.
-  [PARCIAL] RNF05: (1) Captura DONE (2 sub-threads), (2) Envio DONE,
-            (3) Recepção thread criada mas função vazia, (4) Renderização
-            apenas placeholder.
+  [DONE]    RNF05: Captura / Envio / Recepção / Renderização em threads
+            separadas.
   [DONE]    RNF06/RNF07: Python 3 + ZeroMQ.
 
   [TODO]    ARQ04/ARQ05/ARQ06: heartbeat, timeouts e failover.
@@ -34,6 +31,7 @@ import threading
 import queue
 import time
 import cv2
+import numpy as np
 import pyaudio
 
 from presenca import ClientePresenca, CTRL_PORT, PRESENCE_PORT
@@ -53,6 +51,10 @@ AUDIO_RATE = 16000
 AUDIO_CHANNELS = 1
 AUDIO_FORMAT = pyaudio.paInt16
 AUDIO_CHUNK = 1024
+
+# PortAudio não é totalmente thread-safe na inicialização/terminação;
+# serializar PyAudio() / .terminate() entre threads evita segfault no shutdown.
+_PA_LOCK = threading.Lock()
 
 
 def _captura_video(fila_video, parar_evento):
@@ -90,7 +92,8 @@ def _captura_video(fila_video, parar_evento):
 
 
 def _captura_audio(fila_audio, parar_evento):
-    pa = pyaudio.PyAudio()
+    with _PA_LOCK:
+        pa = pyaudio.PyAudio()
     try:
         stream = pa.open(
             format=AUDIO_FORMAT,
@@ -101,7 +104,8 @@ def _captura_audio(fila_audio, parar_evento):
         )
     except Exception as e:
         print(f"[captura_audio] Microfone indisponível: {e}")
-        pa.terminate()
+        with _PA_LOCK:
+            pa.terminate()
         return
 
     try:
@@ -113,9 +117,13 @@ def _captura_audio(fila_audio, parar_evento):
                 print(f"[captura_audio] Erro na leitura: {e}")
                 break
     finally:
-        stream.stop_stream()
-        stream.close()
-        pa.terminate()
+        try:
+            stream.stop_stream()
+            stream.close()
+        except Exception:
+            pass
+        with _PA_LOCK:
+            pa.terminate()
 
 
 # [DONE] RNF05.1 (Captura) — webcam + microfone em sub-threads dedicadas.
@@ -146,68 +154,232 @@ def capturaImagemeAudio(contexto, fila_video, fila_audio, parar_evento=None):
     t_video.join(timeout=2)
     t_audio.join(timeout=2)
 
-# [TODO] RNF05.4 (Renderização) — montar GUI que consome as filas _sub.
-# [TODO] RNF08: interface desktop (Tkinter / PyQt / OpenCV imshow).
-def renderizacaoInterface(contexto): # não sei o que vai receber de argumentos, provavelmente essa vai ser a última a ser implementada e o texto creio eu que vai ser capturado aqui
-    #implementação
-    print("INTERFACE RENDERIZADA")
+# [DONE] RNF05.4 (Renderização) — consome filas _sub:
+#   - vídeo: decodifica JPEG e abre uma janela cv2 por remetente.
+#   - áudio: stream de saída do PyAudio (escreve chunks conforme chegam).
+#   - texto: imprime no terminal (ignora mensagens do próprio usuário).
+def _render_audio(fila_audio, parar_evento):
+    with _PA_LOCK:
+        pa = pyaudio.PyAudio()
+    try:
+        stream = pa.open(
+            format=AUDIO_FORMAT,
+            channels=AUDIO_CHANNELS,
+            rate=AUDIO_RATE,
+            output=True,
+            frames_per_buffer=AUDIO_CHUNK,
+        )
+    except Exception as e:
+        print(f"[render_audio] Saída de áudio indisponível: {e}")
+        with _PA_LOCK:
+            pa.terminate()
+        return
 
-# [PARCIAL] RNF05.2 (Envio) — thread existe e envia texto; vídeo/áudio ainda
-# não são enviados (frames pegos da fila e descartados com `pass`).
-def pubPacotes(contexto, fila_video, fila_audio, fila_texto, ID, SALA):
-    # [TODO] RF06: substituir IPs hardcoded por endpoints obtidos do service discovery.
-    # [TODO] RF08: implementar seleção de broker (round-robin ou menor latência).
+    try:
+        while not parar_evento.is_set():
+            try:
+                _sala, _sender, dados = fila_audio.get(timeout=0.05)
+                stream.write(dados)
+            except queue.Empty:
+                pass
+            except Exception as e:
+                print(f"[render_audio] Erro: {e}")
+                break
+    finally:
+        try:
+            stream.stop_stream()
+            stream.close()
+        except Exception:
+            pass
+        with _PA_LOCK:
+            pa.terminate()
+
+
+def _render_texto(fila_texto, parar_evento, meu_id):
+    while not parar_evento.is_set():
+        try:
+            sala, sender, texto = fila_texto.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        if sender == meu_id:
+            continue  # não exibe eco da própria mensagem
+        print(f"\n[chat {sala}] {sender}: {texto}\n> ", end="", flush=True)
+
+
+def _render_video(fila_video, parar_evento, meu_id):
+    frames_por_remetente = {}  # sender_id -> frame decodificado mais recente
+
+    try:
+        while not parar_evento.is_set():
+            # drena a fila pegando o frame mais novo de cada remetente
+            drenou = False
+            while True:
+                try:
+                    _sala, sender, payload = fila_video.get_nowait()
+                except queue.Empty:
+                    break
+                if sender == meu_id:
+                    continue  # não mostra a própria webcam como remoto
+                arr = np.frombuffer(payload, dtype=np.uint8)
+                frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if frame is not None:
+                    frames_por_remetente[sender] = frame
+                    drenou = True
+
+            for sid, frame in frames_por_remetente.items():
+                cv2.imshow(f"video - {sid}", frame)
+
+            # waitKey também bombeia eventos da janela — necessário sempre
+            k = cv2.waitKey(1) & 0xFF
+            if k == ord("q"):
+                parar_evento.set()
+                break
+
+            if not drenou:
+                time.sleep(0.01)
+    finally:
+        try:
+            cv2.destroyAllWindows()
+            cv2.waitKey(1)
+        except Exception:
+            pass
+
+
+def renderizacaoInterface(contexto, fila_video, fila_audio, fila_texto, meu_id,
+                          parar_evento=None):
+    if parar_evento is None:
+        parar_evento = threading.Event()
+
+    t_audio = threading.Thread(
+        target=_render_audio, args=(fila_audio, parar_evento), daemon=True
+    )
+    t_texto = threading.Thread(
+        target=_render_texto, args=(fila_texto, parar_evento, meu_id), daemon=True
+    )
+
+    t_audio.start()
+    t_texto.start()
+
+    print("INTERFACE RENDERIZADA (pressione 'q' na janela de vídeo para sair)")
+    _render_video(fila_video, parar_evento, meu_id)
+
+    t_audio.join(timeout=2)
+    t_texto.join(timeout=2)
+
+# [DONE] RNF05.2 (Envio) — vídeo, áudio e texto publicados como multipart
+# [SALA, ID, payload]. SUBs filtram pelo primeiro frame (tópico = SALA).
+def pubPacotes(contexto, fila_video, fila_audio, fila_texto, ID, SALA,
+               parar_evento=None):
+    # [TODO] RF06/RF08: service discovery e seleção de broker.
+    if parar_evento is None:
+        parar_evento = threading.Event()
+
     video_pub = contexto.socket(zmq.PUB)
-    video_pub.connect("tcp://127.0.0.1:5555")   # todo: RF06
+    video_pub.setsockopt(zmq.SNDHWM, 10)  # RNF03: drop de frames em caso de gargalo
+    video_pub.connect("tcp://127.0.0.1:5555")
 
     audio_pub = contexto.socket(zmq.PUB)
     audio_pub.connect("tcp://127.0.0.1:5557")
 
-    texto_dealer = contexto.socket(zmq.DEALER)
-    texto_dealer.connect("tcp://127.0.0.1:5559")
+    texto_pub = contexto.socket(zmq.PUB)
+    texto_pub.connect("tcp://127.0.0.1:5559")
 
-    time.sleep(1) 
+    time.sleep(0.5)  # slow-joiner: aguarda SUBs se conectarem antes de publicar
 
-    print("Cliente PUB Iniciado")
+    sala_b = SALA.encode()
+    id_b = ID.encode()
 
-    while True:
-        # [TODO] RF04: frame agora JÁ chega como bytes JPEG da fila (capturaImagemeAudio).
-        # Basta: video_pub.send_multipart([SALA.encode(), ID.encode(), frame])
-        # [TODO] RF03: prefixar com SALA para permitir filtragem por grupo nos SUBs.
-        try:
-            frame = fila_video.get(timeout=0.01)
-            # Se usar OpenCV vai chegar uma matriz numpy, precisa converter para bytes puros antes de usar a função debaixo
-            # video_pub.send(frame_convertido_em_bytes)
-            pass
-        except queue.Empty:
-            pass # Fila estava vazia, segue o jogo
+    print("Cliente PUB iniciado")
 
-        # [TODO] RF04: audio também já chega em bytes puros (PyAudio paInt16).
-        # audio_pub.send_multipart([SALA.encode(), ID.encode(), audio])
-        try:
-            audio = fila_audio.get(timeout=0.01)
-            # se usar o PyAudio, se eu não me engano ja vem em byter puros, aí é só descomentar a linha debaixo que ja da certo
-            # mas caso não seja bytes puros vai ter que converter antes de usar
-            # audio_pub.send(audio_em_bytes)
-            pass
-        except queue.Empty:
-            pass
+    try:
+        while not parar_evento.is_set():
+            try:
+                frame = fila_video.get(timeout=0.01)
+                video_pub.send_multipart([sala_b, id_b, frame])
+            except queue.Empty:
+                pass
 
-        # [DONE] RF04 (texto)
-        # [TODO] RNF01: adicionar política de retry (ACK + reenvio) para chat.
-        try:
-            texto = fila_texto.get(timeout=0.01)
-            # Se for texto, envia como string com a tag do remetente
-            texto_dealer.send_string(f"{SALA} {ID} {texto}")
-        except queue.Empty:
-            pass
+            try:
+                audio = fila_audio.get(timeout=0.01)
+                audio_pub.send_multipart([sala_b, id_b, audio])
+            except queue.Empty:
+                pass
 
-# [TODO] RNF05.3 (Recepção) — implementar.
-# Deve conectar em: XPUB vídeo (5556), XPUB áudio (5558), DEALER texto (5560)
-# e preencher as filas _sub para a thread de renderização consumir.
-# [TODO] RF03: setsockopt(zmq.SUBSCRIBE, SALA) para filtrar pelo grupo do usuário.
-def subPacotes(contexto, fila_video, fila_audio, fila_texto, SALA):
-    print("Pacotes recebidos")
+            # [TODO] RNF01: adicionar política de retry (ACK + reenvio) para chat.
+            try:
+                texto = fila_texto.get(timeout=0.01)
+                texto_pub.send_multipart([sala_b, id_b, texto.encode("utf-8")])
+            except queue.Empty:
+                pass
+    finally:
+        video_pub.close(linger=0)
+        audio_pub.close(linger=0)
+        texto_pub.close(linger=0)
+
+# [DONE] RNF05.3 (Recepção) — SUB nos 3 canais do broker, filtrado por SALA.
+# Cada pacote é [SALA, ID_remetente, payload]. Empilha em filas para a thread
+# de renderização consumir.
+def subPacotes(contexto, fila_video, fila_audio, fila_texto, SALA,
+               parar_evento=None):
+    if parar_evento is None:
+        parar_evento = threading.Event()
+
+    sala_b = SALA.encode()
+
+    video_sub = contexto.socket(zmq.SUB)
+    video_sub.setsockopt(zmq.RCVHWM, 10)
+    video_sub.connect("tcp://127.0.0.1:5556")
+    video_sub.setsockopt(zmq.SUBSCRIBE, sala_b)
+
+    audio_sub = contexto.socket(zmq.SUB)
+    audio_sub.connect("tcp://127.0.0.1:5558")
+    audio_sub.setsockopt(zmq.SUBSCRIBE, sala_b)
+
+    texto_sub = contexto.socket(zmq.SUB)
+    texto_sub.connect("tcp://127.0.0.1:5560")
+    texto_sub.setsockopt(zmq.SUBSCRIBE, sala_b)
+
+    poller = zmq.Poller()
+    poller.register(video_sub, zmq.POLLIN)
+    poller.register(audio_sub, zmq.POLLIN)
+    poller.register(texto_sub, zmq.POLLIN)
+
+    print("Cliente SUB iniciado")
+
+    try:
+        while not parar_evento.is_set():
+            try:
+                socks = dict(poller.poll(200))
+            except zmq.ContextTerminated:
+                break
+
+            if video_sub in socks:
+                try:
+                    sala, sender, payload = video_sub.recv_multipart(zmq.NOBLOCK)
+                    fila_video.put((sala.decode(), sender.decode(), payload))
+                except (zmq.Again, ValueError):
+                    pass
+
+            if audio_sub in socks:
+                try:
+                    sala, sender, payload = audio_sub.recv_multipart(zmq.NOBLOCK)
+                    fila_audio.put((sala.decode(), sender.decode(), payload))
+                except (zmq.Again, ValueError):
+                    pass
+
+            if texto_sub in socks:
+                try:
+                    sala, sender, payload = texto_sub.recv_multipart(zmq.NOBLOCK)
+                    fila_texto.put(
+                        (sala.decode(), sender.decode(),
+                         payload.decode("utf-8", errors="replace"))
+                    )
+                except (zmq.Again, ValueError):
+                    pass
+    finally:
+        video_sub.close(linger=0)
+        audio_sub.close(linger=0)
+        texto_sub.close(linger=0)
 
 
 def fazer_login(cp: ClientePresenca) -> str:
@@ -237,11 +409,12 @@ def escolher_sala(cp: ClientePresenca) -> str:
             return sala
 
 
-def menu_controle(cp: ClientePresenca, parar_evento: threading.Event) -> None:
-    """[DONE] RF02/RF03 — loop interativo: listar online, entrar/sair de salas."""
+def menu_controle(cp: ClientePresenca, parar_evento: threading.Event,
+                  fila_texto_pub: queue.Queue, sala_atual: str) -> None:
+    """[DONE] RF02/RF03/RF04(texto) — loop interativo do terminal."""
     ajuda = (
         "\nComandos: [l] listar online  [s] listar sala  [j <S>] join  "
-        "[x <S>] leave  [q] sair\n"
+        "[x <S>] leave  [m <texto>] enviar msg  [q] sair\n"
     )
     print(ajuda)
     try:
@@ -275,6 +448,10 @@ def menu_controle(cp: ClientePresenca, parar_evento: threading.Event) -> None:
                 print(f"  broker: {cp.join(partes[1].upper())}")
             elif cmd == "x" and len(partes) == 2:
                 print(f"  broker: {cp.leave(partes[1].upper())}")
+            elif cmd == "m" and len(partes) >= 2:
+                texto = linha[1:].lstrip()  # tudo após o "m"
+                fila_texto_pub.put(texto)
+                print(f"  [você → {sala_atual}] {texto}")
             else:
                 print(ajuda)
     except (EOFError, KeyboardInterrupt):
@@ -314,24 +491,36 @@ def main():
     )
     t_envio = threading.Thread(
         target=pubPacotes,
-        args=(contexto, fila_video_pub, fila_audio_pub, fila_texto_pub, ID, SALA),
+        args=(contexto, fila_video_pub, fila_audio_pub, fila_texto_pub, ID, SALA,
+              parar_evento),
         daemon=True,
     )
     t_recep = threading.Thread(
         target=subPacotes,
-        args=(contexto, fila_video_sub, fila_audio_sub, fila_texto_sub, SALA),
+        args=(contexto, fila_video_sub, fila_audio_sub, fila_texto_sub, SALA,
+              parar_evento),
+        daemon=True,
+    )
+    t_render = threading.Thread(
+        target=renderizacaoInterface,
+        args=(contexto, fila_video_sub, fila_audio_sub, fila_texto_sub, ID,
+              parar_evento),
         daemon=True,
     )
 
     t_captura.start()
     t_envio.start()
     t_recep.start()
+    t_render.start()
 
     try:
-        menu_controle(cp, parar_evento)
+        menu_controle(cp, parar_evento, fila_texto_pub, SALA)
     finally:
         print("\nEncerrando o cliente...")
         parar_evento.set()
+        # dá tempo para as threads saírem dos pollers e fecharem sockets
+        for t in (t_envio, t_recep, t_render, t_captura):
+            t.join(timeout=1)
         try:
             print(f"  broker: {cp.logout()}")
         except Exception as e:

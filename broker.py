@@ -12,9 +12,8 @@ Status dos requisitos cobertos neste arquivo:
   [DONE]    RNF04: threads para processamento assíncrono (4 threads).
   [DONE]    RNF06/RNF07: Python 3 + ZeroMQ.
 
-  [TODO]    RNF01: entrega garantida de texto — ROUTER/DEALER com zmq.proxy
-            faz load-balancing (1 destinatário), não fan-out. Para chat em sala
-            precisa de broker customizado OU trocar para PUB/SUB + retry.
+  [TODO]    RNF01: entrega garantida de texto — canal agora é XPUB/XSUB
+            (fan-out por sala). Falta retry com ACK no cliente.
   [TODO]    ARQ01/ARQ02/ARQ03: cluster de N brokers + roteamento inter-brokers
             (XPUB/XSUB cross-broker) sem loops. Hoje há só 1 broker.
   [TODO]    ARQ04: heartbeat (PING/PONG com clientes).
@@ -59,29 +58,19 @@ def roteador_audio(context):    # [DONE] RF05/RNF02: canal de áudio unidirecion
     print("Canal de ÁUDIO (XPUB/XSUB) nas portas 5557 e 5558")
     zmq.proxy(frontend, backend)
 
-def roteador_texto(context):    # [PARCIAL] RF05 canal unidirecional ok; RNF01 incompleto (ver abaixo)
-    # ROUTER/DEALER garantem que mensagens de texto não sejam descartadas
-    # caso um cliente pisque na rede.
-    # [TODO] RNF01: zmq.proxy(ROUTER, DEALER) faz load-balancing (entrega a
-    # apenas 1 cliente), não fan-out por sala. Para chat de grupo (RF03),
-    # trocar para PUB/SUB com tópico=SALA + retry no cliente, OU escrever
-    # broker customizado que itere sobre identidades ROUTER por sala.
-    frontend = context.socket(zmq.ROUTER)   # Cria um socket do tipo ROUTER
-    frontend.bind("tcp://*:5559")           # Atribui a porta 5559 a ele
+def roteador_texto(context):    # [DONE] RF05 canal unidirecional; [TODO] RNF01 retry
+    frontend = context.socket(zmq.XSUB)
+    frontend.bind("tcp://*:5559")
 
-    backend = context.socket(zmq.DEALER)    # Cria o socket do tipo DEALER
-    backend.bind("tcp://*:5560")            # atribui a porta
-    
-    print("Canal de TEXTO (ROUTER/DEALER) nas portas 5559 e 5560")
+    backend = context.socket(zmq.XPUB)
+    backend.bind("tcp://*:5560")
+
+    print("Canal de TEXTO (XPUB/XSUB) nas portas 5559 e 5560")
     zmq.proxy(frontend, backend)
 
-    # Diferente do padrão PUB/SUB o ROUTER/DEALER não faz o descarte silencioso de pacotes, ele atua como um roteador assincrono
-    # garantindo a entrega dos pacotes (mesmo que atrasados)
-    # O ROUTER lê automaticamente o ID de cada cliente que se conecta a ele, permitindo rastrear de onde veio a mensagem.
-    # O DEALER é o distribuidor que repassa essas mensagens.
-    # A função proxy entre os dois cria uma fila em memória segura. Se a conexão de um cliente oscilar 
-    # durante o envio/recebimento de um chat, o pacote de texto não é jogado no vácuo; ele fica retido 
-    # na fila do ZeroMQ até ser entregue, não havendo perda de informação.
+    # Texto agora usa fan-out por tópico=SALA, igual vídeo/áudio.
+    # [TODO] RNF01: PUB/SUB é best-effort. Adicionar política de retry
+    # (ACK por destinatário + reenvio) no cliente para entrega garantida.
 
 def controle_presenca(context, parar_evento=None, ctrl_port=CTRL_PORT,
                       presence_port=PRESENCE_PORT, estado=None):
