@@ -32,6 +32,7 @@ Protocolo (linha de texto simples, separado por espaço):
 from __future__ import annotations
 
 import threading
+import time
 from typing import Dict, List, Set, Tuple
 
 import zmq
@@ -40,12 +41,19 @@ import zmq
 CTRL_PORT = 5561     # ROUTER do broker (requisições de controle)
 PRESENCE_PORT = 5562  # PUB do broker (eventos de presença/sala)
 
+# ARQ04: heartbeat para detectar clientes que cairam sem LOGOUT (ex.: terminal
+# fechado à força). Cliente envia HEARTBEAT a cada HEARTBEAT_INTERVAL; broker
+# expira usuários cujo último heartbeat passou de HEARTBEAT_TIMEOUT.
+HEARTBEAT_INTERVAL = 2.0
+HEARTBEAT_TIMEOUT = 8.0
+
 
 class EstadoPresenca:
     """Tabela em memória de usuários online e suas salas."""
 
     def __init__(self) -> None:
         self._usuarios: Dict[str, Set[str]] = {}
+        self._last_seen: Dict[str, float] = {}
         self._lock = threading.Lock()
 
     def login(self, uid: str) -> Tuple[bool, str]:
@@ -56,6 +64,7 @@ class EstadoPresenca:
             if uid in self._usuarios:
                 return False, f"ERR ID '{uid}' ja em uso"
             self._usuarios[uid] = set()
+            self._last_seen[uid] = time.time()
             return True, f"OK LOGIN {uid}"
 
     def logout(self, uid: str) -> Tuple[bool, str, List[str]]:
@@ -63,7 +72,27 @@ class EstadoPresenca:
             if uid not in self._usuarios:
                 return False, f"ERR ID '{uid}' nao logado", []
             salas = sorted(self._usuarios.pop(uid))
+            self._last_seen.pop(uid, None)
             return True, f"OK LOGOUT {uid}", salas
+
+    def heartbeat(self, uid: str) -> Tuple[bool, str]:
+        with self._lock:
+            if uid not in self._usuarios:
+                return False, f"ERR ID '{uid}' nao logado"
+            self._last_seen[uid] = time.time()
+            return True, "OK PONG"
+
+    def expire_stale(self, timeout: float) -> List[Tuple[str, List[str]]]:
+        """Remove usuários sem heartbeat recente. Retorna [(uid, [salas]), ...]."""
+        agora = time.time()
+        expirados: List[Tuple[str, List[str]]] = []
+        with self._lock:
+            for uid, ts in list(self._last_seen.items()):
+                if agora - ts > timeout:
+                    salas = sorted(self._usuarios.pop(uid, set()))
+                    self._last_seen.pop(uid, None)
+                    expirados.append((uid, salas))
+        return expirados
 
     def join(self, uid: str, sala: str) -> Tuple[bool, str]:
         with self._lock:
@@ -127,6 +156,10 @@ def handle_cmd(estado: EstadoPresenca, msg: str) -> Tuple[str, List[str]]:
             f"{uid}:{','.join(salas) if salas else '-'}" for uid, salas in d.items()
         )
         return f"OK LIST {itens}", []
+
+    if cmd == "HEARTBEAT" and len(partes) == 2:
+        _, resp = estado.heartbeat(partes[1])
+        return resp, []
 
     if cmd == "LIST_SALA" and len(partes) == 2:
         membros = estado.list_sala(partes[1])
@@ -197,6 +230,7 @@ class ClientePresenca:
 
         self._parar = threading.Event()
         self._sub_thread: threading.Thread | None = None
+        self._hb_thread: threading.Thread | None = None
         self._estado_lock = threading.Lock()
 
     # --- internals ----------------------------------------------------------
@@ -239,6 +273,8 @@ class ClientePresenca:
         self._parar.set()
         if self._sub_thread is not None:
             self._sub_thread.join(timeout=1)
+        if self._hb_thread is not None:
+            self._hb_thread.join(timeout=1)
         self.ID = None
         self.salas.clear()
         return resp
@@ -271,6 +307,8 @@ class ClientePresenca:
         self._parar.set()
         if self._sub_thread is not None:
             self._sub_thread.join(timeout=1)
+        if self._hb_thread is not None:
+            self._hb_thread.join(timeout=1)
         with self._req_lock:
             self._req.close(linger=0)
 
@@ -281,6 +319,21 @@ class ClientePresenca:
         self._parar.clear()
         self._sub_thread = threading.Thread(target=self._loop_sub, daemon=True)
         self._sub_thread.start()
+        self._hb_thread = threading.Thread(target=self._loop_heartbeat, daemon=True)
+        self._hb_thread.start()
+
+    def _loop_heartbeat(self) -> None:
+        # ARQ04: mantém o broker ciente de que estamos vivos. Sem isso, um
+        # encerramento abrupto (terminal fechado) deixaria o usuário "online"
+        # para sempre na tabela do broker.
+        while not self._parar.is_set():
+            if self.ID is not None:
+                self._cmd(f"HEARTBEAT {self.ID}")
+            # sleep em pedaços para responder rápido ao parar
+            t = 0.0
+            while t < HEARTBEAT_INTERVAL and not self._parar.is_set():
+                time.sleep(0.1)
+                t += 0.1
 
     def _loop_sub(self) -> None:
         sub = self._ctx.socket(zmq.SUB)

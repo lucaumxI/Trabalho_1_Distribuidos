@@ -32,7 +32,12 @@ import queue
 import time
 import cv2
 import numpy as np
-import pyaudio
+
+try:
+    import pyaudio  # type: ignore
+except Exception as _e:
+    pyaudio = None
+    print(f"[init] PyAudio indisponível ({_e}); áudio será desabilitado.")
 
 from presenca import ClientePresenca, CTRL_PORT, PRESENCE_PORT
 
@@ -49,7 +54,7 @@ VIDEO_JPEG_QUALITY = 70
 
 AUDIO_RATE = 16000
 AUDIO_CHANNELS = 1
-AUDIO_FORMAT = pyaudio.paInt16
+AUDIO_FORMAT = pyaudio.paInt16 if pyaudio is not None else 0
 AUDIO_CHUNK = 1024
 
 # PortAudio não é totalmente thread-safe na inicialização/terminação;
@@ -92,8 +97,15 @@ def _captura_video(fila_video, parar_evento):
 
 
 def _captura_audio(fila_audio, parar_evento):
-    with _PA_LOCK:
-        pa = pyaudio.PyAudio()
+    if pyaudio is None:
+        print("[captura_audio] PyAudio indisponível; pulando captura.")
+        return
+    try:
+        with _PA_LOCK:
+            pa = pyaudio.PyAudio()
+    except Exception as e:
+        print(f"[captura_audio] Falha ao iniciar PyAudio: {e}")
+        return
     try:
         stream = pa.open(
             format=AUDIO_FORMAT,
@@ -158,9 +170,22 @@ def capturaImagemeAudio(contexto, fila_video, fila_audio, parar_evento=None):
 #   - vídeo: decodifica JPEG e abre uma janela cv2 por remetente.
 #   - áudio: stream de saída do PyAudio (escreve chunks conforme chegam).
 #   - texto: imprime no terminal (ignora mensagens do próprio usuário).
-def _render_audio(fila_audio, parar_evento):
-    with _PA_LOCK:
-        pa = pyaudio.PyAudio()
+def _render_audio(fila_audio, parar_evento, meu_id):
+    if pyaudio is None:
+        print("[render_audio] PyAudio indisponível; áudio remoto não tocará.")
+        # drena a fila para não acumular memória.
+        while not parar_evento.is_set():
+            try:
+                fila_audio.get(timeout=0.2)
+            except queue.Empty:
+                pass
+        return
+    try:
+        with _PA_LOCK:
+            pa = pyaudio.PyAudio()
+    except Exception as e:
+        print(f"[render_audio] Falha ao iniciar PyAudio: {e}")
+        return
     try:
         stream = pa.open(
             format=AUDIO_FORMAT,
@@ -178,10 +203,26 @@ def _render_audio(fila_audio, parar_evento):
     try:
         while not parar_evento.is_set():
             try:
-                _sala, _sender, dados = fila_audio.get(timeout=0.05)
-                stream.write(dados)
+                _sala, sender, dados = fila_audio.get(timeout=0.05)
             except queue.Empty:
-                pass
+                continue
+            # Bug: o cliente recebia o próprio áudio, dobrando o fluxo de
+            # entrada e gerando latência crescente.
+            if sender == meu_id:
+                continue
+            # Se a fila acumulou (PUB chega mais rápido que a saída), pula
+            # adiante para evitar atraso percebido — RNF03 (drop adaptativo).
+            while fila_audio.qsize() > 5:
+                try:
+                    _sala, sender, dados = fila_audio.get_nowait()
+                except queue.Empty:
+                    break
+                if sender == meu_id:
+                    dados = None
+            if dados is None:
+                continue
+            try:
+                stream.write(dados)
             except Exception as e:
                 print(f"[render_audio] Erro: {e}")
                 break
@@ -251,7 +292,7 @@ def renderizacaoInterface(contexto, fila_video, fila_audio, fila_texto, meu_id,
         parar_evento = threading.Event()
 
     t_audio = threading.Thread(
-        target=_render_audio, args=(fila_audio, parar_evento), daemon=True
+        target=_render_audio, args=(fila_audio, parar_evento, meu_id), daemon=True
     )
     t_texto = threading.Thread(
         target=_render_texto, args=(fila_texto, parar_evento, meu_id), daemon=True
@@ -279,6 +320,7 @@ def pubPacotes(contexto, fila_video, fila_audio, fila_texto, ID, SALA,
     video_pub.connect("tcp://127.0.0.1:5555")
 
     audio_pub = contexto.socket(zmq.PUB)
+    audio_pub.setsockopt(zmq.SNDHWM, 10)
     audio_pub.connect("tcp://127.0.0.1:5557")
 
     texto_pub = contexto.socket(zmq.PUB)
@@ -332,6 +374,7 @@ def subPacotes(contexto, fila_video, fila_audio, fila_texto, SALA,
     video_sub.setsockopt(zmq.SUBSCRIBE, sala_b)
 
     audio_sub = contexto.socket(zmq.SUB)
+    audio_sub.setsockopt(zmq.RCVHWM, 10)
     audio_sub.connect("tcp://127.0.0.1:5558")
     audio_sub.setsockopt(zmq.SUBSCRIBE, sala_b)
 

@@ -21,10 +21,17 @@ Status dos requisitos cobertos neste arquivo:
   [TODO]    RF07: endpoint de registro dinâmico (ou arquivo discovery separado).
 """
 
+import time
 import zmq
 import threading
 
-from presenca import EstadoPresenca, handle_cmd, CTRL_PORT, PRESENCE_PORT
+from presenca import (
+    EstadoPresenca,
+    handle_cmd,
+    CTRL_PORT,
+    PRESENCE_PORT,
+    HEARTBEAT_TIMEOUT,
+)
 
 def roteador_video(context):    # [DONE] RF05/RNF03: canal de vídeo unidirecional com drop de frames
     # Thread para roteador de vídeo
@@ -93,9 +100,22 @@ def controle_presenca(context, parar_evento=None, ctrl_port=CTRL_PORT,
 
     print(f"Canal de CONTROLE (ROUTER) na porta {ctrl_port} | PRESENÇA (PUB) na porta {presence_port}")
 
+    ultimo_check = time.time()
+
     try:
         while parar_evento is None or not parar_evento.is_set():
             socks = dict(poller.poll(200))
+
+            # ARQ04: expira usuários sem heartbeat (terminal fechado à força).
+            agora = time.time()
+            if agora - ultimo_check > 1.0:
+                ultimo_check = agora
+                for uid, salas in estado.expire_stale(HEARTBEAT_TIMEOUT):
+                    print(f"[presenca] expirando '{uid}' por inatividade")
+                    for s in salas:
+                        pub.send_string(f"SALA {s} LEAVE {uid}")
+                    pub.send_string(f"PRESENCE OFFLINE {uid}")
+
             if router not in socks:
                 continue
             frames = router.recv_multipart()
