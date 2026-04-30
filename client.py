@@ -752,19 +752,26 @@ class ClienteApp:
 
 
 def main():
-    if len(sys.argv) >= 2:
-        user_id = sys.argv[1]
-    else:
+    import argparse
+    parser = argparse.ArgumentParser(description="Cliente de videoconferência")
+    parser.add_argument("user_id", nargs="?", help="Seu ID de usuário")
+    parser.add_argument("sala", nargs="?", default="SALA_A", help="Sala (default: SALA_A)")
+    parser.add_argument("--registry-host", default=None,
+                        help="IP do registry (default: valor do config.py)")
+    args = parser.parse_args()
+
+    if args.registry_host:
+        import config
+        config.REGISTRY_HOST = args.registry_host
+
+    user_id = args.user_id
+    if not user_id:
         user_id = input("Digite seu ID: ").strip()
         if not user_id:
             print("ID inválido.")
             return
 
-    sala = "SALA_A"
-    if len(sys.argv) >= 3:
-        sala = sys.argv[2]
-
-    app = ClienteApp(user_id, sala)
+    app = ClienteApp(user_id, args.sala)
     app.run()
 
 
