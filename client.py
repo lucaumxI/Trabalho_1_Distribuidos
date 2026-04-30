@@ -67,9 +67,13 @@ def selecionar_broker(brokers: list[dict], _idx=[0]) -> dict | None:
 
 
 class ClienteApp:
-    def __init__(self, user_id: str, sala: str):
+    def __init__(self, user_id: str, sala: str,
+                 registry_host: str = REGISTRY_HOST,
+                 registry_port: int = REGISTRY_PORT):
         self.user_id = user_id
         self.sala = sala
+        self.registry_host = registry_host
+        self.registry_port = registry_port
         self.ctx = zmq.Context()
         self.parar = threading.Event()
 
@@ -109,7 +113,7 @@ class ClienteApp:
 
     # --- Conexão com broker ---
     def _conectar_broker(self) -> bool:
-        brokers = descobrir_brokers()
+        brokers = descobrir_brokers(self.registry_host, self.registry_port)
         broker = selecionar_broker(brokers)
         if broker is None:
             print("[cliente] Nenhum broker disponível.")
@@ -756,13 +760,11 @@ def main():
     parser = argparse.ArgumentParser(description="Cliente de videoconferência")
     parser.add_argument("user_id", nargs="?", help="Seu ID de usuário")
     parser.add_argument("sala", nargs="?", default="SALA_A", help="Sala (default: SALA_A)")
-    parser.add_argument("--registry-host", default=None,
-                        help="IP do registry (default: valor do config.py)")
+    parser.add_argument("--registry-host", default=REGISTRY_HOST,
+                        help=f"IP do registry (default: {REGISTRY_HOST})")
+    parser.add_argument("--registry-port", type=int, default=REGISTRY_PORT,
+                        help=f"Porta do registry (default: {REGISTRY_PORT})")
     args = parser.parse_args()
-
-    if args.registry_host:
-        import config
-        config.REGISTRY_HOST = args.registry_host
 
     user_id = args.user_id
     if not user_id:
@@ -771,7 +773,9 @@ def main():
             print("ID inválido.")
             return
 
-    app = ClienteApp(user_id, args.sala)
+    app = ClienteApp(user_id, args.sala,
+                     registry_host=args.registry_host,
+                     registry_port=args.registry_port)
     app.run()
 
 
