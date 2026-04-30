@@ -1,9 +1,8 @@
 """
-Controle de Qualidade de Serviço (QoS) por tipo de mídia.
-
-- Texto:  garantia de entrega via retry com ACK
-- Vídeo:  taxa adaptativa + drop de frames antigos
-- Áudio:  baixa latência, descarta chunks antigos se fila crescer
+QoS por tipo de mídia:
+  - Texto:  retry em caso de falha de envio (seq + reenvio com timeout)
+  - Vídeo:  taxa adaptativa (ajusta qualidade JPEG) + drop de frames antigos
+  - Áudio:  baixa latência, descarta chunks antigos se fila crescer
 """
 
 import queue
@@ -18,11 +17,12 @@ from config import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Texto — entrega confiável
-# ---------------------------------------------------------------------------
 class TextoReliableSender:
-    """Armazena mensagens enviadas e reenvia se não receber ACK a tempo."""
+    """
+    Armazena mensagens enviadas e reenvia se o send falhar.
+    Como PUB/SUB não tem ACK real, o retry protege contra falhas
+    no socket (ex: buffer cheio, reconexão) — não contra perda no broker.
+    """
 
     def __init__(self):
         self._pending: dict[int, dict] = {}
@@ -64,9 +64,6 @@ class TextoReliableSender:
         return reenviar
 
 
-# ---------------------------------------------------------------------------
-# Vídeo — taxa adaptativa
-# ---------------------------------------------------------------------------
 class VideoAdaptiveBuffer:
     """Ajusta qualidade JPEG com base no tamanho da fila de saída."""
 
@@ -74,6 +71,7 @@ class VideoAdaptiveBuffer:
         self.quality = VIDEO_JPEG_QUALITY
 
     def ajustar(self, fila: queue.Queue):
+        """Reduz qualidade se fila estiver grande, restaura se estiver ok."""
         sz = fila.qsize()
         if sz > VIDEO_ADAPTIVE_QUEUE_HIGH:
             self.quality = max(VIDEO_MIN_QUALITY, self.quality - 5)
@@ -81,7 +79,6 @@ class VideoAdaptiveBuffer:
             self.quality = min(VIDEO_JPEG_QUALITY, self.quality + 5)
 
     def drop_antigos(self, fila: queue.Queue, max_size: int = 10):
-        """Remove frames antigos mantendo no máximo *max_size* na fila."""
         while fila.qsize() > max_size:
             try:
                 fila.get_nowait()
@@ -89,9 +86,6 @@ class VideoAdaptiveBuffer:
                 break
 
 
-# ---------------------------------------------------------------------------
-# Áudio — baixa latência
-# ---------------------------------------------------------------------------
 def audio_drop_antigos(fila: queue.Queue):
     """Descarta chunks antigos se fila ultrapassar AUDIO_MAX_QUEUE."""
     while fila.qsize() > AUDIO_MAX_QUEUE:

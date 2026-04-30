@@ -1,19 +1,47 @@
-"""
-Captura de vídeo (webcam) e áudio (microfone) em threads dedicadas.
-"""
+"""Captura de vídeo (webcam) e áudio (microfone) em threads dedicadas."""
 
 import sys
+import subprocess
 import threading
 import time
 import queue
 
 import cv2
-import pyaudio
 
 from config import (
     VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FPS, VIDEO_JPEG_QUALITY,
     AUDIO_RATE, AUDIO_CHANNELS, AUDIO_FORMAT, AUDIO_CHUNK,
 )
+
+_PA_LOCK = threading.Lock()
+
+# Testa se PyAudio consegue inicializar sem crashar (abort no PortAudio).
+# Roda num subprocesso porque o abort() mata o processo inteiro.
+# Importa cv2 no teste porque OpenCV carrega ALSA internamente e isso
+# pode interferir na inicializacao do PortAudio.
+def _testar_pyaudio() -> bool:
+    code = (
+        "import cv2; "
+        "import pyaudio; "
+        "p = pyaudio.PyAudio(); "
+        "p.terminate()"
+    )
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True, timeout=15,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+_PYAUDIO_OK = _testar_pyaudio()
+
+if _PYAUDIO_OK:
+    import pyaudio
+else:
+    pyaudio = None
+    print("[media_capture] PyAudio indisponível (sem dispositivo de áudio); áudio desabilitado.")
 
 
 def _captura_video(fila_video: queue.Queue, parar_evento: threading.Event):
@@ -50,7 +78,16 @@ def _captura_video(fila_video: queue.Queue, parar_evento: threading.Event):
 
 
 def _captura_audio(fila_audio: queue.Queue, parar_evento: threading.Event):
-    pa = pyaudio.PyAudio()
+    if not _PYAUDIO_OK:
+        return
+
+    try:
+        with _PA_LOCK:
+            pa = pyaudio.PyAudio()
+    except Exception as e:
+        print(f"[captura_audio] Falha ao iniciar PyAudio: {e}")
+        return
+
     try:
         stream = pa.open(
             format=AUDIO_FORMAT,
@@ -61,7 +98,8 @@ def _captura_audio(fila_audio: queue.Queue, parar_evento: threading.Event):
         )
     except Exception as e:
         print(f"[captura_audio] Microfone indisponível: {e}")
-        pa.terminate()
+        with _PA_LOCK:
+            pa.terminate()
         return
 
     try:
@@ -73,14 +111,17 @@ def _captura_audio(fila_audio: queue.Queue, parar_evento: threading.Event):
                 print(f"[captura_audio] Erro na leitura: {e}")
                 break
     finally:
-        stream.stop_stream()
-        stream.close()
-        pa.terminate()
+        try:
+            stream.stop_stream()
+            stream.close()
+        except Exception:
+            pass
+        with _PA_LOCK:
+            pa.terminate()
 
 
 def captura_midia(fila_video: queue.Queue, fila_audio: queue.Queue,
                   parar_evento: threading.Event):
-    """Inicia sub-threads de captura de vídeo e áudio e aguarda término."""
     t_video = threading.Thread(
         target=_captura_video, args=(fila_video, parar_evento), daemon=True
     )

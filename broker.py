@@ -1,12 +1,10 @@
 """
-Broker de videoconferência distribuído.
-
-Funcionalidades:
-  - 3 canais XPUB/XSUB (vídeo, áudio, texto) com proxy
-  - Canal de controle REP (JOIN/LEAVE/presença)
-  - Heartbeat PUB periódico
+Broker de videoconferência distribuído com:
+  - 3 canais XPUB/XSUB (vídeo, áudio, texto)
+  - Controle de presença ROUTER/PUB (login, salas, heartbeat de clientes)
+  - Heartbeat PUB periódico (broker->cliente para failover)
   - Registro dinâmico no registry (service discovery)
-  - Comunicação inter-broker PUB/SUB (replicação de mensagens entre brokers)
+  - Comunicação inter-broker PUB/SUB
 """
 
 import json
@@ -23,9 +21,12 @@ from config import (
     OFF_TEXTO_XSUB, OFF_TEXTO_XPUB,
     OFF_CONTROLE, OFF_HEARTBEAT,
     OFF_INTER_PUB, OFF_INTER_SUB,
+    OFF_PRESENCE_PUB,
     HEARTBEAT_INTERVAL_S, HEARTBEAT_TIMEOUT_S,
+    CLIENT_HB_TIMEOUT,
     VIDEO_HWM, AUDIO_HWM,
 )
+from presenca import EstadoPresenca, handle_cmd
 
 
 class Broker:
@@ -38,16 +39,13 @@ class Broker:
         self.registry_port = registry_port
         self.ctx = zmq.Context()
 
-        self._salas: dict[str, set[str]] = {}
-        self._lock = threading.Lock()
+        self._estado = EstadoPresenca()
         self._parar = threading.Event()
 
     def _p(self, offset: int) -> int:
         return self.port_base + offset
 
-    # ------------------------------------------------------------------
-    # Registry — registro periódico
-    # ------------------------------------------------------------------
+    # --- Registry: registro periódico ---
     def _thread_registry(self):
         sock = self.ctx.socket(zmq.REQ)
         sock.setsockopt(zmq.RCVTIMEO, 3000)
@@ -65,20 +63,18 @@ class Broker:
                 sock.send_string(msg)
                 sock.recv_string()
             except zmq.Again:
-                print(f"[broker {self.broker_id}] Registry não respondeu — tentando novamente")
+                print(f"[broker {self.broker_id}] Registry sem resposta")
             except zmq.ZMQError:
                 break
             self._parar.wait(HEARTBEAT_INTERVAL_S * 2)
 
         sock.close()
 
-    # ------------------------------------------------------------------
-    # Heartbeat PUB
-    # ------------------------------------------------------------------
+    # --- Heartbeat PUB (broker -> cliente) ---
     def _thread_heartbeat(self):
         sock = self.ctx.socket(zmq.PUB)
         sock.bind(f"tcp://*:{self._p(OFF_HEARTBEAT)}")
-        print(f"[broker {self.broker_id}] Heartbeat PUB na porta {self._p(OFF_HEARTBEAT)}")
+        print(f"[broker {self.broker_id}] Heartbeat PUB porta {self._p(OFF_HEARTBEAT)}")
 
         while not self._parar.is_set():
             payload = json.dumps({
@@ -90,106 +86,69 @@ class Broker:
 
         sock.close()
 
-    # ------------------------------------------------------------------
-    # Canal de controle REP — JOIN / LEAVE / presença
-    # ------------------------------------------------------------------
+    # --- Controle de presença (ROUTER + PUB) ---
     def _thread_controle(self):
-        sock = self.ctx.socket(zmq.REP)
-        sock.setsockopt(zmq.RCVTIMEO, 1000)
-        sock.bind(f"tcp://*:{self._p(OFF_CONTROLE)}")
-        print(f"[broker {self.broker_id}] Controle REP na porta {self._p(OFF_CONTROLE)}")
+        """
+        ROUTER recebe comandos síncronos (LOGIN/LOGOUT/JOIN/LEAVE/LIST/HEARTBEAT).
+        PUB publica eventos assíncronos (PRESENCE ONLINE/OFFLINE, SALA JOIN/LEAVE).
+        Expira clientes inativos via heartbeat timeout.
+        """
+        router = self.ctx.socket(zmq.ROUTER)
+        router.setsockopt(zmq.LINGER, 0)
+        router.bind(f"tcp://*:{self._p(OFF_CONTROLE)}")
+
+        pub = self.ctx.socket(zmq.PUB)
+        pub.setsockopt(zmq.LINGER, 0)
+        pub.bind(f"tcp://*:{self._p(OFF_PRESENCE_PUB)}")
+
+        poller = zmq.Poller()
+        poller.register(router, zmq.POLLIN)
+
+        print(f"[broker {self.broker_id}] Controle ROUTER porta {self._p(OFF_CONTROLE)} | "
+              f"Presença PUB porta {self._p(OFF_PRESENCE_PUB)}")
+
+        ultimo_check = time.time()
 
         while not self._parar.is_set():
-            try:
-                raw = sock.recv_string()
-            except zmq.Again:
+            socks = dict(poller.poll(200))
+
+            # Expira usuários sem heartbeat recente
+            agora = time.time()
+            if agora - ultimo_check > 1.0:
+                ultimo_check = agora
+                for uid, salas in self._estado.expire_stale(CLIENT_HB_TIMEOUT):
+                    print(f"[broker {self.broker_id}] Expirando '{uid}' por inatividade")
+                    for s in salas:
+                        pub.send_string(f"SALA {s} LEAVE {uid}")
+                    pub.send_string(f"PRESENCE OFFLINE {uid}")
+
+            if router not in socks:
                 continue
 
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                sock.send_string(json.dumps({"status": "error"}))
+            frames = router.recv_multipart()
+            if len(frames) < 3:
                 continue
 
-            action = msg.get("action")
-            user_id = msg.get("user_id", "")
-            sala = msg.get("sala", "")
+            identity = frames[0]
+            payload = frames[2]
+            try:
+                msg = payload.decode("utf-8", errors="replace")
+            except Exception:
+                msg = ""
 
-            if action == "join":
-                resp = self._handle_join(user_id, sala)
-            elif action == "leave":
-                resp = self._handle_leave(user_id, sala)
-            elif action == "presenca":
-                resp = self._handle_presenca(sala)
-            else:
-                resp = {"status": "error", "msg": "ação desconhecida"}
+            resposta, eventos = handle_cmd(self._estado, msg)
+            router.send_multipart([identity, b"", resposta.encode("utf-8")])
 
-            sock.send_string(json.dumps(resp))
+            for ev in eventos:
+                pub.send_string(ev)
+                # Log de eventos importantes
+                if "JOIN" in ev or "LEAVE" in ev or "ONLINE" in ev or "OFFLINE" in ev:
+                    print(f"[broker {self.broker_id}] {ev}")
 
-        sock.close()
+        router.close(linger=0)
+        pub.close(linger=0)
 
-    def _handle_join(self, user_id: str, sala: str) -> dict:
-        with self._lock:
-            if sala not in self._salas:
-                self._salas[sala] = set()
-            todos = set()
-            for membros in self._salas.values():
-                todos |= membros
-            if user_id in todos:
-                for s, membros in self._salas.items():
-                    if user_id in membros:
-                        membros.discard(user_id)
-                        break
-            self._salas[sala].add(user_id)
-            membros_lista = sorted(self._salas[sala])
-        print(f"[broker {self.broker_id}] JOIN {user_id} -> {sala} "
-              f"(membros: {membros_lista})")
-        return {"status": "ok", "membros": membros_lista}
-
-    def _handle_leave(self, user_id: str, sala: str) -> dict:
-        with self._lock:
-            if sala in self._salas:
-                self._salas[sala].discard(user_id)
-        print(f"[broker {self.broker_id}] LEAVE {user_id} <- {sala}")
-        return {"status": "ok"}
-
-    def _handle_presenca(self, sala: str) -> dict:
-        with self._lock:
-            membros = sorted(self._salas.get(sala, set()))
-        return {"status": "ok", "membros": membros}
-
-    # ------------------------------------------------------------------
-    # Proxy de presença PUB — publica periodicamente quem está em cada sala
-    # ------------------------------------------------------------------
-    def _thread_presenca_pub(self):
-        sock = self.ctx.socket(zmq.PUB)
-        porta_texto_xpub = self._p(OFF_TEXTO_XPUB)
-        time.sleep(1)
-
-        while not self._parar.is_set():
-            with self._lock:
-                for sala, membros in self._salas.items():
-                    info = json.dumps({
-                        "tipo": "presenca",
-                        "sala": sala,
-                        "membros": sorted(membros),
-                        "broker_id": self.broker_id,
-                    })
-                    try:
-                        sock.send_multipart([
-                            sala.encode(),
-                            b"__SISTEMA__",
-                            info.encode(),
-                        ])
-                    except zmq.ZMQError:
-                        pass
-            self._parar.wait(2.0)
-
-        sock.close()
-
-    # ------------------------------------------------------------------
-    # Canais de mídia XPUB/XSUB
-    # ------------------------------------------------------------------
+    # --- Canais de mídia XPUB/XSUB ---
     def _proxy_video(self):
         frontend = self.ctx.socket(zmq.XSUB)
         frontend.setsockopt(zmq.RCVHWM, VIDEO_HWM)
@@ -227,14 +186,8 @@ class Broker:
               f"{self._p(OFF_TEXTO_XSUB)}/{self._p(OFF_TEXTO_XPUB)}")
         zmq.proxy(frontend, backend)
 
-    # ------------------------------------------------------------------
-    # Inter-broker PUB/SUB
-    # ------------------------------------------------------------------
+    # --- Inter-broker PUB/SUB ---
     def _thread_inter_broker(self):
-        """
-        Assina mensagens de outros brokers via SUB e republica localmente.
-        Também publica mensagens locais para outros brokers via PUB.
-        """
         pub = self.ctx.socket(zmq.PUB)
         pub.bind(f"tcp://*:{self._p(OFF_INTER_PUB)}")
 
@@ -242,6 +195,7 @@ class Broker:
         sub.setsockopt(zmq.RCVTIMEO, 1000)
         sub.setsockopt_string(zmq.SUBSCRIBE, "")
 
+        # SUBs locais para capturar mensagens dos clientes deste broker
         local_xsub_video = self.ctx.socket(zmq.SUB)
         local_xsub_video.setsockopt_string(zmq.SUBSCRIBE, "")
         local_xsub_video.setsockopt(zmq.RCVTIMEO, 100)
@@ -257,6 +211,7 @@ class Broker:
         local_xsub_texto.setsockopt(zmq.RCVTIMEO, 100)
         local_xsub_texto.connect(f"tcp://127.0.0.1:{self._p(OFF_TEXTO_XPUB)}")
 
+        # PUBs locais para injetar mensagens de outros brokers
         local_pub_video = self.ctx.socket(zmq.PUB)
         local_pub_video.connect(f"tcp://127.0.0.1:{self._p(OFF_VIDEO_XSUB)}")
 
@@ -267,8 +222,7 @@ class Broker:
         local_pub_texto.connect(f"tcp://127.0.0.1:{self._p(OFF_TEXTO_XSUB)}")
 
         connected_brokers: set[str] = set()
-        print(f"[broker {self.broker_id}] Inter-broker PUB porta "
-              f"{self._p(OFF_INTER_PUB)}")
+        print(f"[broker {self.broker_id}] Inter-broker PUB porta {self._p(OFF_INTER_PUB)}")
 
         time.sleep(0.5)
 
@@ -279,7 +233,6 @@ class Broker:
         poller.register(local_xsub_texto, zmq.POLLIN)
 
         while not self._parar.is_set():
-            # Descobrir novos brokers e conectar SUB
             self._atualizar_peers_inter_broker(sub, connected_brokers)
 
             try:
@@ -287,13 +240,13 @@ class Broker:
             except zmq.ZMQError:
                 break
 
-            # Mensagens vindas de OUTROS brokers -> republicar localmente
+            # Mensagens de OUTROS brokers -> republicar localmente
             if sub in events:
                 try:
                     frames = sub.recv_multipart(zmq.NOBLOCK)
                     if len(frames) >= 4:
-                        canal = frames[0]    # b"video", b"audio", b"texto"
-                        origin = frames[1]   # broker_id de origem
+                        canal = frames[0]
+                        origin = frames[1]
                         if origin.decode() != self.broker_id:
                             dados = frames[2:]
                             if canal == b"video":
@@ -345,9 +298,7 @@ class Broker:
         except (zmq.Again, zmq.ZMQError):
             pass
 
-    # ------------------------------------------------------------------
-    # Run
-    # ------------------------------------------------------------------
+    # --- Run ---
     def run(self):
         threads = [
             threading.Thread(target=self._proxy_video, daemon=True),

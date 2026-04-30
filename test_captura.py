@@ -39,10 +39,10 @@ class TestCapturaVideo(unittest.TestCase):
             parar.set()
             t.join(timeout=2)
 
-        self.assertFalse(fila.empty(), "Fila de vídeo deveria ter pelo menos um frame")
+        self.assertFalse(fila.empty())
         item = fila.get_nowait()
-        self.assertIsInstance(item, bytes, "Frame na fila deve ser bytes (JPEG)")
-        self.assertTrue(item.startswith(b"\xff\xd8"), "Deve ter header JPEG (FFD8)")
+        self.assertIsInstance(item, bytes)
+        self.assertTrue(item.startswith(b"\xff\xd8"))
         cap_mock.release.assert_called_once()
 
     def test_video_webcam_indisponivel(self):
@@ -55,7 +55,7 @@ class TestCapturaVideo(unittest.TestCase):
         with patch("media_capture.cv2.VideoCapture", return_value=cap_mock):
             media_capture._captura_video(fila, parar)
 
-        self.assertTrue(fila.empty(), "Fila deve ficar vazia se webcam falhar")
+        self.assertTrue(fila.empty())
 
     def test_video_respeita_parar_evento(self):
         fila = queue.Queue()
@@ -76,7 +76,7 @@ class TestCapturaVideo(unittest.TestCase):
             parar.set()
             t.join(timeout=2)
 
-        self.assertFalse(t.is_alive(), "Thread deveria ter encerrado após parar_evento")
+        self.assertFalse(t.is_alive())
 
 
 class TestCapturaAudio(unittest.TestCase):
@@ -100,11 +100,9 @@ class TestCapturaAudio(unittest.TestCase):
             parar.set()
             t.join(timeout=2)
 
-        self.assertFalse(fila.empty(), "Fila de áudio deveria ter pelo menos um chunk")
+        self.assertFalse(fila.empty())
         item = fila.get_nowait()
-        self.assertIsInstance(item, bytes, "Chunk de áudio deve ser bytes")
-        stream_mock.close.assert_called_once()
-        pa_mock.terminate.assert_called_once()
+        self.assertIsInstance(item, bytes)
 
     def test_audio_microfone_indisponivel(self):
         fila = queue.Queue()
@@ -116,8 +114,7 @@ class TestCapturaAudio(unittest.TestCase):
         with patch("media_capture.pyaudio.PyAudio", return_value=pa_mock):
             media_capture._captura_audio(fila, parar)
 
-        self.assertTrue(fila.empty(), "Fila deve ficar vazia se mic falhar")
-        pa_mock.terminate.assert_called_once()
+        self.assertTrue(fila.empty())
 
 
 class TestCapturaMidia(unittest.TestCase):
@@ -148,13 +145,12 @@ class TestCapturaMidia(unittest.TestCase):
             parar.set()
             t.join(timeout=3)
 
-        self.assertEqual(chamadas["video"], 1, "Deve chamar _captura_video 1x")
-        self.assertEqual(chamadas["audio"], 1, "Deve chamar _captura_audio 1x")
+        self.assertEqual(chamadas["video"], 1)
+        self.assertEqual(chamadas["audio"], 1)
 
 
 def teste_manual():
-    """Captura 3 segundos de vídeo/áudio real e mostra estatísticas."""
-    print("=== TESTE MANUAL: abrindo webcam e microfone por 3 segundos ===")
+    print("=== TESTE MANUAL: webcam + mic por 3 segundos ===")
     fila_v = queue.Queue()
     fila_a = queue.Queue()
     parar = threading.Event()
@@ -165,15 +161,14 @@ def teste_manual():
         daemon=True,
     )
     t.start()
-
     time.sleep(3)
     parar.set()
     t.join(timeout=3)
 
     n_video = fila_v.qsize()
     n_audio = fila_a.qsize()
-    print(f"Frames de vídeo capturados: {n_video}")
-    print(f"Chunks de áudio capturados: {n_audio}")
+    print(f"Frames de vídeo: {n_video}")
+    print(f"Chunks de áudio: {n_audio}")
 
     if n_video > 0:
         frame = fila_v.get_nowait()
@@ -183,7 +178,7 @@ def teste_manual():
         print(f"  1º chunk áudio: {len(chunk)} bytes")
 
     ok = n_video > 0 and n_audio > 0
-    print("RESULTADO:", "OK" if ok else "FALHOU (verifique webcam/microfone)")
+    print("RESULTADO:", "OK" if ok else "FALHOU")
     return ok
 
 

@@ -1,11 +1,8 @@
 """
 Service Discovery — Registry centralizado.
 
-Brokers se registram periodicamente; clientes consultam a lista de brokers
-ativos.  Brokers que não renovam registro dentro de HEARTBEAT_TIMEOUT_S são
-removidos automaticamente.
-
-Protocolo JSON via REQ/REP na porta REGISTRY_PORT.
+Brokers se registram periodicamente via JSON/REQ-REP.
+Brokers que não renovam registro são removidos automaticamente.
 
 Ações aceitas:
   {"action": "register", "broker_id": "...", "host": "...", "port_base": N}
@@ -30,7 +27,6 @@ class Registry:
         self._brokers: dict[str, dict] = {}
         self._lock = threading.Lock()
 
-    # ---- limpeza periódica ------------------------------------------------
     def _limpar_expirados(self):
         agora = time.time()
         with self._lock:
@@ -39,7 +35,7 @@ class Registry:
                 if agora - info["last_seen"] > HEARTBEAT_TIMEOUT_S * 2
             ]
             for bid in expirados:
-                print(f"[registry] Broker expirado removido: {bid}")
+                print(f"[registry] Broker expirado: {bid}")
                 del self._brokers[bid]
 
     def _loop_limpeza(self):
@@ -47,7 +43,6 @@ class Registry:
             time.sleep(HEARTBEAT_TIMEOUT_S)
             self._limpar_expirados()
 
-    # ---- handlers ---------------------------------------------------------
     def _handle_register(self, msg: dict) -> dict:
         bid = msg["broker_id"]
         with self._lock:
@@ -57,8 +52,7 @@ class Registry:
                 "port_base": msg["port_base"],
                 "last_seen": time.time(),
             }
-        print(f"[registry] Broker registrado/renovado: {bid} "
-              f"({msg['host']}:{msg['port_base']})")
+        print(f"[registry] Broker registrado: {bid} ({msg['host']}:{msg['port_base']})")
         return {"status": "ok"}
 
     def _handle_discover(self) -> dict:
@@ -79,7 +73,6 @@ class Registry:
         print(f"[registry] Broker removido: {bid}")
         return {"status": "ok"}
 
-    # ---- loop principal ---------------------------------------------------
     def run(self):
         ctx = zmq.Context()
         sock = ctx.socket(zmq.REP)

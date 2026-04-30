@@ -5,8 +5,8 @@
 Sistema de videoconferência desktop em **Python 3** que suporta transmissão de
 **Vídeo**, **Áudio** e **Texto** em salas de grupo (A–K). A arquitetura é
 distribuída, com **N brokers cooperando**, **service discovery** dinâmico,
-**tolerância a falhas** via heartbeat/failover e **QoS diferenciado** por tipo
-de mídia.
+**tolerância a falhas** via heartbeat/failover, **controle de presença** robusto
+com eventos em tempo real e **QoS diferenciado** por tipo de mídia.
 
 ---
 
@@ -31,16 +31,15 @@ de mídia.
 
 ### 2.1 Componentes
 
-
-| Componente   | Arquivo            | Responsabilidade                                                             |
-| ------------ | ------------------ | ---------------------------------------------------------------------------- |
-| **Registry** | `registry.py`      | Service discovery; mantém lista de brokers ativos                            |
-| **Broker**   | `broker.py`        | Roteamento de mídia (XPUB/XSUB), controle de sessão, heartbeat, inter-broker |
-| **Cliente**  | `client.py`        | GUI Tkinter, captura, envio, recepção, failover                              |
-| **Captura**  | `media_capture.py` | Threads de webcam (OpenCV) e microfone (PyAudio)                             |
-| **QoS**      | `qos.py`           | Retry de texto, buffer adaptativo de vídeo, drop de áudio                    |
-| **Config**   | `config.py`        | Constantes compartilhadas (portas, timeouts, parâmetros)                     |
-
+| Componente    | Arquivo            | Responsabilidade                                                       |
+| ------------- | ------------------ | ---------------------------------------------------------------------- |
+| **Registry**  | `registry.py`      | Service discovery; mantém lista de brokers ativos                      |
+| **Broker**    | `broker.py`        | Roteamento de mídia (XPUB/XSUB), presença (ROUTER/PUB), heartbeat, inter-broker |
+| **Presença**  | `presenca.py`      | Identidade, presença e salas — lógica pura (EstadoPresenca + handle_cmd) |
+| **Cliente**   | `client.py`        | GUI Tkinter, captura, envio, recepção, failover, playback de áudio     |
+| **Captura**   | `media_capture.py` | Threads de webcam (OpenCV) e microfone (PyAudio)                       |
+| **QoS**       | `qos.py`           | Retry de texto, buffer adaptativo de vídeo, drop de áudio              |
+| **Config**    | `config.py`        | Constantes compartilhadas (portas, timeouts, parâmetros)               |
 
 ### 2.2 Estrutura de Arquivos
 
@@ -49,11 +48,13 @@ projeto/
 ├── config.py            # Constantes compartilhadas
 ├── registry.py          # Service Discovery (REQ/REP)
 ├── broker.py            # Broker distribuído
+├── presenca.py          # Identidade, presença e salas
 ├── client.py            # Cliente com GUI Tkinter
 ├── media_capture.py     # Captura de vídeo e áudio
 ├── qos.py               # QoS por tipo de mídia
 ├── demo.py              # Script de demonstração
-├── test_captura.py      # Testes unitários
+├── test_captura.py      # Testes de captura
+├── test_presenca.py     # Testes de presença e salas
 ├── requirements.txt     # Dependências
 └── documento_tecnico.md # Este documento
 ```
@@ -69,23 +70,17 @@ Clientes PUB  ──►  [XSUB  Broker  XPUB]  ──►  Clientes SUB
 (enviam)            (proxy)                     (recebem)
 ```
 
-**Justificativa**: XPUB/XSUB com `zmq.proxy()` cria um intermediário
-transparente que:
-
-- Permite fan-out (um-para-muitos) — essencial para salas de grupo
-- Propaga subscrições automaticamente do backend para o frontend
-- Suporta filtragem por tópico (prefixo `SALA_X` nos frames)
-- Permite HWM (High Water Mark) para controle de backpressure
+O padrão XPUB/XSUB com `zmq.proxy()` cria um intermediário transparente que
+permite fan-out (um-para-muitos) com filtragem por tópico (prefixo `SALA_X`) e
+controle de backpressure via HWM (High Water Mark).
 
 **Portas por broker** (offset relativo à porta-base):
 
-
-| Canal | XSUB (entrada) | XPUB (saída) |
-| ----- | -------------- | ------------ |
-| Vídeo | base+0         | base+1       |
-| Áudio | base+2         | base+3       |
-| Texto | base+4         | base+5       |
-
+| Canal       | XSUB (entrada) | XPUB (saída) |
+| ----------- | -------------- | ------------ |
+| Vídeo       | base+0         | base+1       |
+| Áudio       | base+2         | base+3       |
+| Texto       | base+4         | base+5       |
 
 **Formato das mensagens multipart**:
 
@@ -95,155 +90,153 @@ Frame 1: USER_ID (remetente)
 Frame 2: DADOS (JPEG / PCM / JSON)
 ```
 
-### 3.2 REQ/REP — Service Discovery e Controle de Sessão
+### 3.2 ROUTER/PUB — Controle de Presença e Sessão
 
-**Registry** (porta 6000):
+```
+Cliente REQ  ──►  Broker ROUTER  (comandos síncronos)
+                  Broker PUB     ──►  Cliente SUB (eventos assíncronos)
+```
+
+O broker usa ROUTER (porta base+6) para receber comandos de presença e PUB
+(porta base+10) para publicar eventos em tempo real.
+
+**Protocolo texto** (separado por espaço):
+
+| Comando               | Resposta              | Evento publicado             |
+| --------------------- | --------------------- | ---------------------------- |
+| `LOGIN <id>`          | `OK LOGIN <id>`       | `PRESENCE ONLINE <id>`       |
+| `LOGOUT <id>`         | `OK LOGOUT <id>`      | `PRESENCE OFFLINE <id>`      |
+| `JOIN <id> <sala>`    | `OK JOIN <id> <sala>` | `SALA <sala> JOIN <id>`      |
+| `LEAVE <id> <sala>`   | `OK LEAVE <id> <sala>`| `SALA <sala> LEAVE <id>`     |
+| `LIST`                | `OK LIST <dados>`     | —                            |
+| `LIST_SALA <sala>`    | `OK LIST_SALA ...`    | —                            |
+| `HEARTBEAT <id>`      | `OK PONG`             | —                            |
+
+### 3.3 REQ/REP — Service Discovery
 
 ```
 Cliente/Broker  ──REQ──►  Registry ──REP──►  resposta JSON
 ```
 
-Ações do registry:
+Ações: `register`, `discover`, `unregister`.
 
-- `register` — broker se registra (chamado periodicamente)
-- `discover` — cliente consulta lista de brokers ativos
-- `unregister` — broker se desregistra ao encerrar
-
-**Controle de sessão** (porta base+6 de cada broker):
+### 3.4 PUB/SUB — Heartbeat (Broker → Cliente)
 
 ```
-Cliente  ──REQ──►  Broker ──REP──►  resposta JSON
+Broker PUB (base+7)  ──►  "HB {broker_id, timestamp}"  ──►  Cliente SUB
+                                                              (timeout → failover)
 ```
 
-Ações de controle:
+Cada broker publica heartbeat a cada 1s. O cliente monitora: se 3s sem
+heartbeat, inicia failover automático.
 
-- `join` — entrar numa sala (valida unicidade do ID)
-- `leave` — sair de uma sala
-- `presenca` — consultar membros de uma sala
-
-### 3.3 PUB/SUB — Heartbeat
-
-```
-Broker  ──PUB──►  "HB {broker_id, timestamp}"  ──►  Cliente SUB
-                                                       (timeout → failover)
-```
-
-Cada broker publica heartbeat a cada 1 segundo na porta base+7.
-O cliente assina e monitora: se não receber por 3 segundos, inicia failover.
-
-### 3.4 PUB/SUB — Comunicação Inter-Broker
+### 3.5 PUB/SUB — Comunicação Inter-Broker
 
 ```
 Broker A PUB (base+8)  ──►  Broker B SUB
 Broker B PUB (base+8)  ──►  Broker A SUB
 ```
 
-Cada broker:
-
-1. Assina mensagens locais do seu próprio XPUB (vídeo/áudio/texto)
-2. Republica para outros brokers via PUB inter-broker
-3. Recebe mensagens de outros brokers via SUB
-4. Injeta no XSUB local para distribuição aos seus clientes
-
-**Prevenção de loops**: cada mensagem inter-broker carrega o `broker_id`
-de origem. O broker receptor ignora mensagens originadas de si mesmo.
+Cada broker assina mensagens locais do seu XPUB, republica para outros brokers,
+e injeta mensagens recebidas de outros brokers no XSUB local. O campo
+`broker_id` em cada mensagem previne loops.
 
 ---
 
 ## 4. Threads do Sistema
 
-### 4.1 Cliente (5 threads)
+### 4.1 Cliente (8 threads)
 
-
-| Thread        | Função                | Detalhe                                             |
-| ------------- | --------------------- | --------------------------------------------------- |
-| **Captura**   | `captura_midia()`     | Sub-threads: webcam (OpenCV) + microfone (PyAudio)  |
-| **Envio**     | `_thread_envio()`     | PUB vídeo/áudio/texto para broker                   |
-| **Recepção**  | `_thread_recepcao()`  | SUB vídeo/áudio/texto do broker via `zmq.Poller`    |
-| **Heartbeat** | `_thread_heartbeat()` | Monitora broker, dispara failover                   |
-| **GUI**       | Thread principal      | Tkinter mainloop, `root.after()` para poll de filas |
-
+| Thread               | Função                                                  |
+| -------------------- | ------------------------------------------------------- |
+| **Captura**          | `captura_midia()` — sub-threads: webcam + microfone     |
+| **Envio**            | `_thread_envio()` — PUB vídeo/áudio/texto               |
+| **Recepção**         | `_thread_recepcao()` — SUB vídeo/áudio/texto            |
+| **HB Broker**        | `_thread_heartbeat()` — monitora broker, failover       |
+| **HB Cliente**       | `_thread_client_heartbeat()` — mantém presença no broker|
+| **Presença SUB**     | `_thread_presenca_sub()` — eventos ONLINE/OFFLINE/SALA  |
+| **Áudio Playback**   | `_thread_audio_playback()` — reproduz áudio via PyAudio |
+| **GUI**              | Thread principal — Tkinter mainloop                     |
 
 ### 4.2 Broker (7 threads)
 
-
-| Thread                 | Função                                |
-| ---------------------- | ------------------------------------- |
-| `_proxy_video`         | zmq.proxy(XSUB, XPUB) para vídeo      |
-| `_proxy_audio`         | zmq.proxy(XSUB, XPUB) para áudio      |
-| `_proxy_texto`         | zmq.proxy(XSUB, XPUB) para texto      |
-| `_thread_controle`     | REP para JOIN/LEAVE/presença          |
-| `_thread_heartbeat`    | PUB periódico de heartbeat            |
-| `_thread_registry`     | Registro periódico no registry        |
-| `_thread_inter_broker` | PUB/SUB para replicação entre brokers |
-
+| Thread                 | Função                                        |
+| ---------------------- | --------------------------------------------- |
+| `_proxy_video`         | zmq.proxy(XSUB, XPUB) para vídeo             |
+| `_proxy_audio`         | zmq.proxy(XSUB, XPUB) para áudio             |
+| `_proxy_texto`         | zmq.proxy(XSUB, XPUB) para texto             |
+| `_thread_controle`     | ROUTER/PUB — presença, salas, heartbeat       |
+| `_thread_heartbeat`    | PUB periódico de heartbeat                    |
+| `_thread_registry`     | Registro periódico no registry                |
+| `_thread_inter_broker` | PUB/SUB para replicação entre brokers         |
 
 ---
 
 ## 5. Estratégia de Tolerância a Falhas
 
-### 5.1 Detecção de Falha
+### 5.1 Heartbeat Bidirecional
 
-1. **Heartbeat**: broker publica `HB` a cada 1s via PUB dedicado
-2. **Timeout**: cliente monitora via SUB; se 3s sem heartbeat → broker morto
-3. **Registry**: também remove brokers que não renovam registro
+O sistema usa heartbeat em duas direções:
+
+1. **Broker → Cliente** (PUB/SUB): broker publica `HB` a cada 1s na porta
+   base+7. Se o cliente não recebe por 3s, considera o broker morto e inicia
+   failover.
+
+2. **Cliente → Broker** (REQ): cliente envia `HEARTBEAT <id>` a cada 2s via
+   socket de controle. Se o broker não recebe por 8s, expira o usuário da
+   tabela de presença e publica evento OFFLINE.
 
 ### 5.2 Failover Automático
 
-Ao detectar queda:
+Ao detectar queda do broker:
 
 1. Cliente seta flag `_reconectar_evt` → threads de envio/recepção pausam
 2. Consulta registry para lista de brokers vivos
 3. Seleciona novo broker (round-robin)
-4. Reconecta todos os sockets (vídeo, áudio, texto, heartbeat)
-5. Re-envia `JOIN` para manter sessão na sala
-6. Limpa flag → threads retomam operação
+4. Recria socket de controle e faz LOGIN + JOIN no novo broker
+5. Limpa flag → threads retomam operação
 
 ### 5.3 Garantias
 
-- **Texto**: mensagens em trânsito durante failover podem ser perdidas, mas
-o mecanismo de retry (QoS) reenvia mensagens sem ACK
-- **Vídeo/Áudio**: perda de alguns frames/chunks é aceitável (best-effort)
-- **Sessão**: preservada via re-JOIN automático no novo broker
+- **Texto**: retry protege contra falhas de envio (socket error, buffer cheio).
+  Como PUB/SUB é best-effort, mensagens em trânsito durante failover podem
+  ser perdidas.
+- **Vídeo/Áudio**: perda de frames/chunks é aceitável (best-effort).
+- **Sessão**: preservada via re-LOGIN + re-JOIN automático no novo broker.
 
 ---
 
 ## 6. Controle de Qualidade de Serviço (QoS)
 
-### 6.1 Texto — Garantia de Entrega
-
+### 6.1 Texto — Retry em Falha de Envio
 
 | Aspecto            | Implementação                                      |
 | ------------------ | -------------------------------------------------- |
-| **Mecanismo**      | Retry com sequência numérica                       |
+| **Mecanismo**      | Retry com sequência numérica + timeout             |
 | **Buffer**         | `TextoReliableSender` armazena mensagens pendentes |
 | **Timeout**        | 2 segundos para reenvio                            |
 | **Max tentativas** | 3 (depois descarta)                                |
-| **Padrão ZMQ**     | XPUB/XSUB (fan-out para sala)                      |
-
+| **Dedup**          | Receptor ignora mensagens com `seq` já visto       |
 
 ### 6.2 Áudio — Baixa Latência
 
-
-| Aspecto        | Implementação                    |
-| -------------- | -------------------------------- |
-| **Prioridade** | Latência mínima, tolerando perda |
-| **Buffer**     | Fila limitada a 5 chunks         |
-| **Overflow**   | Descarta chunks mais antigos     |
-| **HWM broker** | 50 (mais permissivo que vídeo)   |
-
+| Aspecto        | Implementação                             |
+| -------------- | ----------------------------------------- |
+| **Playback**   | PyAudio output stream em thread dedicada  |
+| **Buffer**     | Fila limitada a 5 chunks                  |
+| **Overflow**   | Descarta chunks antigos (pula pra frente) |
+| **HWM broker** | 50                                        |
 
 ### 6.3 Vídeo — Taxa Adaptativa
-
 
 | Aspecto         | Implementação                                        |
 | --------------- | ---------------------------------------------------- |
 | **Adaptação**   | `VideoAdaptiveBuffer` ajusta qualidade JPEG          |
-| **Trigger**     | Fila de saída > 15 → reduz qualidade (mín. 30%)      |
-| **Recuperação** | Fila < 5 → restaura qualidade (máx. 70%)             |
+| **Trigger**     | Fila de saída > 15 → reduz qualidade (mín. 30%)     |
+| **Recuperação** | Fila < 5 → restaura qualidade (máx. 70%)            |
+| **Re-encode**   | Thread de envio re-codifica JPEG na qualidade atual  |
 | **Drop**        | Frames antigos descartados quando fila excede limite |
-| **HWM broker**  | 10 (descarte agressivo no broker)                    |
-
+| **HWM broker**  | 10                                                   |
 
 ---
 
@@ -251,28 +244,19 @@ o mecanismo de retry (QoS) reenvia mensagens sem ACK
 
 ### 7.1 Fluxo de Registro
 
-```
 1. Registry inicia na porta 6000
-2. Broker B1 inicia → envia {"action": "register", "broker_id": "B1", ...}
-3. Broker B2 inicia → envia {"action": "register", "broker_id": "B2", ...}
+2. Broker B1 inicia → envia `register` com broker_id, host e port_base
+3. Broker B2 inicia → envia `register`
 4. Brokers renovam registro a cada 2s
-5. Registry remove brokers sem renovação após 6s (2× HEARTBEAT_TIMEOUT_S)
-```
+5. Registry remove brokers sem renovação após 6s
 
 ### 7.2 Fluxo de Descoberta (Cliente)
 
-```
-1. Cliente envia {"action": "discover"} ao registry
+1. Cliente envia `discover` ao registry
 2. Registry responde com lista de brokers ativos
 3. Cliente seleciona broker por round-robin
 4. Cliente conecta nos sockets do broker selecionado
-5. Cliente envia JOIN para entrar na sala
-```
-
-### 7.3 Seleção de Broker
-
-Implementação: **round-robin** com índice global incrementado a cada chamada.
-O índice persiste entre failovers, garantindo distribuição equilibrada.
+5. Cliente faz LOGIN + JOIN para entrar na sala
 
 ---
 
@@ -281,14 +265,15 @@ O índice persiste entre failovers, garantindo distribuição equilibrada.
 ### 8.1 Login
 
 - ID simples via argumento CLI ou input interativo
-- Unicidade garantida: ao fazer JOIN, broker verifica se ID já existe em
-qualquer sala e remove da anterior (transferência de sala)
+- Unicidade validada no broker via `EstadoPresenca`: LOGIN retorna ERR se
+  ID já está em uso
 
 ### 8.2 Presença
 
-- Broker mantém dicionário `{sala: set(user_ids)}`
-- Publicação periódica de lista de presença via tópico especial no canal
-de texto: `{"tipo": "presenca", "sala": "...", "membros": [...]}`
+- Broker mantém `EstadoPresenca` com tabela `{user_id: set(salas)}`
+- Eventos em tempo real via PUB: PRESENCE ONLINE/OFFLINE, SALA JOIN/LEAVE
+- Cliente mantém lista de online via SUB assíncrono
+- Expiração automática de clientes inativos (heartbeat timeout 8s)
 
 ### 8.3 Salas
 
@@ -303,7 +288,7 @@ de texto: `{"tipo": "presenca", "sala": "...", "membros": [...]}`
 ### 9.1 Instalação
 
 ```bash
-git clone <repo>
+git clone https://github.com/lucaumxI/Trabalho_1_Distribuidos.git
 cd Trabalho_1_Distribuidos
 git checkout Rafael
 python3 -m venv .venv
@@ -338,27 +323,23 @@ python client.py Bob SALA_A
 python demo.py
 ```
 
-Executa automaticamente: registry + 2 brokers + comunicação + queda de broker
+Executa: registry + 2 brokers + comunicação inter-broker + queda de broker +
+detecção de falha + failover.
 
-- detecção de falha + failover + comunicação pós-failover.
-
-### 9.4 Testes Unitários
+### 9.4 Testes
 
 ```bash
-python -m unittest test_captura.py -v
+python -m unittest test_captura.py test_presenca.py -v
 ```
 
 ---
 
 ## 10. Dependências
 
-
-| Biblioteca    | Versão | Uso                                   |
-| ------------- | ------ | ------------------------------------- |
-| pyzmq         | latest | Comunicação assíncrona ZeroMQ         |
-| opencv-python | latest | Captura e encoding de vídeo (webcam)  |
-| PyAudio       | latest | Captura de áudio (microfone)          |
-| Pillow        | latest | Conversão de frames JPEG para Tkinter |
-| numpy         | latest | Manipulação de arrays (frames OpenCV) |
-
-
+| Biblioteca    | Versão   | Uso                                   |
+| ------------- | -------- | ------------------------------------- |
+| pyzmq         | 27.1.0   | Comunicação assíncrona ZeroMQ         |
+| opencv-python | 4.13.0   | Captura e encoding de vídeo (webcam)  |
+| PyAudio       | 0.2.14   | Captura e playback de áudio           |
+| Pillow        | 11.2.1   | Conversão de frames JPEG para Tkinter |
+| numpy         | 2.4.4    | Manipulação de arrays (frames OpenCV) |
