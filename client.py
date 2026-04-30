@@ -15,7 +15,6 @@ Threads:
 import json
 import io
 import sys
-import subprocess
 import queue
 import threading
 import time
@@ -27,14 +26,6 @@ import numpy as np
 import zmq
 from PIL import Image, ImageTk
 
-# Importa pyaudio apenas se o subprocesso de teste (em media_capture) confirmou
-# que PortAudio funciona nesta máquina. Evita abort() por ALSA bugado.
-from media_capture import _PYAUDIO_OK
-if _PYAUDIO_OK:
-    import pyaudio
-else:
-    pyaudio = None
-
 from config import (
     REGISTRY_HOST, REGISTRY_PORT, SALAS,
     OFF_VIDEO_XSUB, OFF_VIDEO_XPUB,
@@ -45,11 +36,8 @@ from config import (
     AUDIO_RATE, AUDIO_CHANNELS, AUDIO_FORMAT, AUDIO_CHUNK,
     AUDIO_MAX_QUEUE, VIDEO_JPEG_QUALITY,
 )
-from media_capture import captura_midia
+from media_capture import captura_midia, get_pa, terminate_pa, _PYAUDIO_OK
 from qos import TextoReliableSender, VideoAdaptiveBuffer, audio_drop_antigos
-
-# Lock global para PyAudio (não é totalmente thread-safe)
-_PA_LOCK = threading.Lock()
 
 
 def descobrir_brokers(registry_host: str = REGISTRY_HOST,
@@ -128,8 +116,6 @@ class ClienteApp:
             return False
         with self._broker_lock:
             self.broker_host = broker["host"]
-            if self.broker_host == "0.0.0.0":
-                self.broker_host = "127.0.0.1"
             self.broker_port_base = broker["port_base"]
         print(f"[cliente] Conectado ao broker {broker['broker_id']} "
               f"({self.broker_host}:{self.broker_port_base})")
@@ -386,16 +372,24 @@ class ClienteApp:
                 hb_sub.setsockopt(zmq.RCVTIMEO, int(HEARTBEAT_TIMEOUT_S * 1000))
                 hb_sub.connect(self._bp(OFF_HEARTBEAT))
 
+                # Warmup: SUB leva tempo pra começar a receber (slow joiner).
+                # Espera até 2x o timeout antes de considerar falha real.
+                misses = 0
+                max_misses = 3
+
                 while not self.parar.is_set() and not self._reconectar_evt.is_set():
                     try:
                         hb_sub.recv_string()
+                        misses = 0  # reset ao receber
                     except zmq.Again:
-                        print("[cliente] Heartbeat perdido — iniciando failover...")
-                        self._reconectar_evt.set()
-                        hb_sub.close()
-                        hb_sub = None
-                        self._fazer_failover()
-                        break
+                        misses += 1
+                        if misses >= max_misses:
+                            print("[cliente] Heartbeat perdido — iniciando failover...")
+                            self._reconectar_evt.set()
+                            hb_sub.close()
+                            hb_sub = None
+                            self._fazer_failover()
+                            break
             except zmq.ZMQError:
                 pass
             finally:
@@ -521,20 +515,14 @@ class ClienteApp:
 
     # --- Thread de playback de áudio ---
     def _thread_audio_playback(self):
-        if pyaudio is None:
+        pa = get_pa()
+        if pa is None:
             # Drena a fila pra não acumular memória
             while not self.parar.is_set():
                 try:
                     self.fila_audio_sub.get(timeout=0.2)
                 except queue.Empty:
                     pass
-            return
-
-        try:
-            with _PA_LOCK:
-                pa = pyaudio.PyAudio()
-        except Exception as e:
-            print(f"[audio] Falha ao iniciar PyAudio: {e}")
             return
 
         try:
@@ -547,8 +535,6 @@ class ClienteApp:
             )
         except Exception as e:
             print(f"[audio] Saída de áudio indisponível: {e}")
-            with _PA_LOCK:
-                pa.terminate()
             return
 
         try:
@@ -576,8 +562,6 @@ class ClienteApp:
                 stream.close()
             except Exception:
                 pass
-            with _PA_LOCK:
-                pa.terminate()
 
     # --- Trocar de sala ---
     def trocar_sala(self, nova_sala: str):
@@ -760,6 +744,7 @@ class ClienteApp:
         self.root.mainloop()
 
         self.parar.set()
+        terminate_pa()
         with self._ctrl_lock:
             if self._ctrl_sock is not None:
                 self._ctrl_sock.close(linger=0)

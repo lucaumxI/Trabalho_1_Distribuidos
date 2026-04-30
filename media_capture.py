@@ -13,13 +13,13 @@ from config import (
     AUDIO_RATE, AUDIO_CHANNELS, AUDIO_FORMAT, AUDIO_CHUNK,
 )
 
+# PortAudio não suporta múltiplas inicializações concorrentes (crash/abort).
+# Criamos UMA instância compartilhada de PyAudio, protegida por lock.
 _PA_LOCK = threading.Lock()
+_PA_INSTANCE = None  # será pyaudio.PyAudio() ou None
 
-# Testa se PyAudio consegue inicializar sem crashar (abort no PortAudio).
-# Roda num subprocesso porque o abort() mata o processo inteiro.
-# Importa cv2 no teste porque OpenCV carrega ALSA internamente e isso
-# pode interferir na inicializacao do PortAudio.
 def _testar_pyaudio() -> bool:
+    """Testa PyAudio num subprocesso — se abort(), só o filho morre."""
     code = (
         "import cv2; "
         "import pyaudio; "
@@ -41,7 +41,31 @@ if _PYAUDIO_OK:
     import pyaudio
 else:
     pyaudio = None
-    print("[media_capture] PyAudio indisponível (sem dispositivo de áudio); áudio desabilitado.")
+    print("[media_capture] PyAudio indisponível; áudio desabilitado.")
+
+
+def get_pa() -> "pyaudio.PyAudio | None":
+    """Retorna a instância compartilhada de PyAudio (lazy init, thread-safe)."""
+    global _PA_INSTANCE
+    if not _PYAUDIO_OK:
+        return None
+    with _PA_LOCK:
+        if _PA_INSTANCE is None:
+            try:
+                _PA_INSTANCE = pyaudio.PyAudio()
+            except Exception as e:
+                print(f"[pyaudio] Falha ao iniciar: {e}")
+                return None
+    return _PA_INSTANCE
+
+
+def terminate_pa():
+    """Marca PyAudio como encerrado. Não chama pa.terminate() porque
+    PortAudio/ALSA pode dar segfault se streams já foram fechadas.
+    O OS limpa os recursos quando o processo encerra."""
+    global _PA_INSTANCE
+    with _PA_LOCK:
+        _PA_INSTANCE = None
 
 
 def _captura_video(fila_video: queue.Queue, parar_evento: threading.Event):
@@ -78,14 +102,8 @@ def _captura_video(fila_video: queue.Queue, parar_evento: threading.Event):
 
 
 def _captura_audio(fila_audio: queue.Queue, parar_evento: threading.Event):
-    if not _PYAUDIO_OK:
-        return
-
-    try:
-        with _PA_LOCK:
-            pa = pyaudio.PyAudio()
-    except Exception as e:
-        print(f"[captura_audio] Falha ao iniciar PyAudio: {e}")
+    pa = get_pa()
+    if pa is None:
         return
 
     try:
@@ -98,8 +116,6 @@ def _captura_audio(fila_audio: queue.Queue, parar_evento: threading.Event):
         )
     except Exception as e:
         print(f"[captura_audio] Microfone indisponível: {e}")
-        with _PA_LOCK:
-            pa.terminate()
         return
 
     try:
@@ -116,8 +132,6 @@ def _captura_audio(fila_audio: queue.Queue, parar_evento: threading.Event):
             stream.close()
         except Exception:
             pass
-        with _PA_LOCK:
-            pa.terminate()
 
 
 def captura_midia(fila_video: queue.Queue, fila_audio: queue.Queue,

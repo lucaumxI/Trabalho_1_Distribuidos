@@ -8,11 +8,24 @@ Broker de videoconferência distribuído com:
 """
 
 import json
+import socket
 import time
 import threading
 import argparse
 
 import zmq
+
+
+def _get_local_ip() -> str:
+    """Descobre o IP local da máquina na rede (não 127.0.0.1)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
 
 from config import (
     REGISTRY_HOST, REGISTRY_PORT,
@@ -33,7 +46,9 @@ class Broker:
     def __init__(self, broker_id: str, host: str, port_base: int,
                  registry_host: str, registry_port: int):
         self.broker_id = broker_id
-        self.host = host
+        self.host = host  # usado no bind (0.0.0.0 aceita de qualquer interface)
+        # IP real para registrar no registry (clientes remotos precisam desse IP)
+        self.public_host = _get_local_ip() if host == "0.0.0.0" else host
         self.port_base = port_base
         self.registry_host = registry_host
         self.registry_port = registry_port
@@ -57,7 +72,7 @@ class Broker:
                 msg = json.dumps({
                     "action": "register",
                     "broker_id": self.broker_id,
-                    "host": self.host,
+                    "host": self.public_host,
                     "port_base": self.port_base,
                 })
                 sock.send_string(msg)
@@ -314,7 +329,7 @@ class Broker:
             t.start()
 
         print(f"[broker {self.broker_id}] Todos os canais iniciados "
-              f"(porta-base {self.port_base})")
+              f"(ip {self.public_host}, porta-base {self.port_base})")
 
         try:
             while True:
