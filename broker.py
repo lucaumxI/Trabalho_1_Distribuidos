@@ -39,7 +39,7 @@ def roteador_video(context):    # [DONE] RF05/RNF03: canal de vídeo unidirecion
     # para o PUB dos clientes
     frontend = context.socket(zmq.XSUB) 
     frontend.setsockopt(zmq.RCVHWM, 10) # Drop de frames. Limita a fila de entrada a 10 pacotes jogando fora o excesso
-    frontend.bind("tcp://127.0.0.1:5555")       # Seta a porta 5555 para o XSUB de vídeo, os clientes irão enviar os pacotes para essa porta
+    frontend.bind("tcp://*:5555")       # Seta a porta 5555 para o XSUB de vídeo, os clientes irão enviar os pacotes para essa porta
 
     # Cria um socket do tipo XPUB que irá publicar os pacotes recebidos pelo XSUB e junto com ele faz o controle de qual nó está nesse momento pedindo acesso a determinado pacote.
     backend = context.socket(zmq.XPUB)  
