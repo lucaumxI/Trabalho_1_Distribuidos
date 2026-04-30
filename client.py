@@ -64,10 +64,19 @@ _PA_LOCK = threading.Lock()
 
 def _captura_video(fila_video, parar_evento):
     import sys
-    backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
-    cap = cv2.VideoCapture(0, backend)
-    if not cap.isOpened():
-        print("[captura_video] Webcam indisponível.")
+    cap = None
+    backends = (cv2.CAP_MSMF, cv2.CAP_DSHOW, cv2.CAP_ANY) if sys.platform == "win32" else (cv2.CAP_ANY,)
+    for idx in range(3):
+        for backend in backends:
+            c = cv2.VideoCapture(idx, backend)
+            if c.isOpened():
+                cap = c
+                break
+            c.release()
+        if cap is not None:
+            break
+    if cap is None or not cap.isOpened():
+        print("[captura_video] Webcam indisponível. Verifique: câmera em uso por outro app? Privacidade > Câmera bloqueada no Windows?")
         return
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, VIDEO_WIDTH)
@@ -309,7 +318,7 @@ def renderizacaoInterface(contexto, fila_video, fila_audio, fila_texto, meu_id,
 
 # [DONE] RNF05.2 (Envio) — vídeo, áudio e texto publicados como multipart
 # [SALA, ID, payload]. SUBs filtram pelo primeiro frame (tópico = SALA).
-def pubPacotes(contexto, fila_video, fila_audio, fila_texto, ID, SALA,
+def pubPacotes(contexto, fila_video, fila_audio, fila_texto, ID, sala_ref,
                parar_evento=None):
     # [TODO] RF06/RF08: service discovery e seleção de broker.
     if parar_evento is None:
@@ -328,13 +337,13 @@ def pubPacotes(contexto, fila_video, fila_audio, fila_texto, ID, SALA,
 
     time.sleep(0.5)  # slow-joiner: aguarda SUBs se conectarem antes de publicar
 
-    sala_b = SALA.encode()
     id_b = ID.encode()
 
     print("Cliente PUB iniciado")
 
     try:
         while not parar_evento.is_set():
+            sala_b = sala_ref[0].encode()
             try:
                 frame = fila_video.get(timeout=0.01)
                 video_pub.send_multipart([sala_b, id_b, frame])
@@ -361,12 +370,13 @@ def pubPacotes(contexto, fila_video, fila_audio, fila_texto, ID, SALA,
 # [DONE] RNF05.3 (Recepção) — SUB nos 3 canais do broker, filtrado por SALA.
 # Cada pacote é [SALA, ID_remetente, payload]. Empilha em filas para a thread
 # de renderização consumir.
-def subPacotes(contexto, fila_video, fila_audio, fila_texto, SALA,
+def subPacotes(contexto, fila_video, fila_audio, fila_texto, sala_ref,
                parar_evento=None):
     if parar_evento is None:
         parar_evento = threading.Event()
 
-    sala_b = SALA.encode()
+    sala_atual = sala_ref[0]
+    sala_b = sala_atual.encode()
 
     video_sub = contexto.socket(zmq.SUB)
     video_sub.setsockopt(zmq.RCVHWM, 10)
@@ -391,6 +401,16 @@ def subPacotes(contexto, fila_video, fila_audio, fila_texto, SALA,
 
     try:
         while not parar_evento.is_set():
+            # resubscreve se a sala mudou
+            nova = sala_ref[0]
+            if nova != sala_atual:
+                nova_b = nova.encode()
+                for s in (video_sub, audio_sub, texto_sub):
+                    s.setsockopt(zmq.UNSUBSCRIBE, sala_b)
+                    s.setsockopt(zmq.SUBSCRIBE, nova_b)
+                sala_atual = nova
+                sala_b = nova_b
+
             try:
                 socks = dict(poller.poll(200))
             except zmq.ContextTerminated:
@@ -453,7 +473,7 @@ def escolher_sala(cp: ClientePresenca) -> str:
 
 
 def menu_controle(cp: ClientePresenca, parar_evento: threading.Event,
-                  fila_texto_pub: queue.Queue, sala_atual: str) -> None:
+                  fila_texto_pub: queue.Queue, sala_ref: list) -> None:
     """[DONE] RF02/RF03/RF04(texto) — loop interativo do terminal."""
     ajuda = (
         "\nComandos: [l] listar online  [s] listar sala  [j <S>] join  "
@@ -488,13 +508,25 @@ def menu_controle(cp: ClientePresenca, parar_evento: threading.Event,
                 membros = cp.list_sala(sala)
                 print(f"  sala {sala}: {membros or '(vazia)'}")
             elif cmd == "j" and len(partes) == 2:
-                print(f"  broker: {cp.join(partes[1].upper())}")
+                nova_sala = partes[1].upper()
+                sala_antiga = sala_ref[0]
+                if nova_sala == sala_antiga:
+                    print(f"  já está na sala {nova_sala}")
+                    continue
+                cp.leave(sala_antiga)
+                resp = cp.join(nova_sala)
+                print(f"  broker: {resp}")
+                if resp.startswith("OK"):
+                    sala_ref[0] = nova_sala
+                    print(f"  [sala atual: {nova_sala}]")
+                else:
+                    cp.join(sala_antiga)  # volta para a sala anterior se falhar
             elif cmd == "x" and len(partes) == 2:
                 print(f"  broker: {cp.leave(partes[1].upper())}")
             elif cmd == "m" and len(partes) >= 2:
                 texto = linha[1:].lstrip()  # tudo após o "m"
                 fila_texto_pub.put(texto)
-                print(f"  [você → {sala_atual}] {texto}")
+                print(f"  [você → {sala_ref[0]}] {texto}")
             else:
                 print(ajuda)
     except (EOFError, KeyboardInterrupt):
@@ -514,6 +546,7 @@ def main():
     )
     ID = fazer_login(cp)
     SALA = escolher_sala(cp)
+    sala_ref = [SALA]  # referência mutável compartilhada entre threads
 
     # Filas de Saída (Upload)
     fila_video_pub = queue.Queue()
@@ -534,13 +567,13 @@ def main():
     )
     t_envio = threading.Thread(
         target=pubPacotes,
-        args=(contexto, fila_video_pub, fila_audio_pub, fila_texto_pub, ID, SALA,
+        args=(contexto, fila_video_pub, fila_audio_pub, fila_texto_pub, ID, sala_ref,
               parar_evento),
         daemon=True,
     )
     t_recep = threading.Thread(
         target=subPacotes,
-        args=(contexto, fila_video_sub, fila_audio_sub, fila_texto_sub, SALA,
+        args=(contexto, fila_video_sub, fila_audio_sub, fila_texto_sub, sala_ref,
               parar_evento),
         daemon=True,
     )
@@ -557,7 +590,7 @@ def main():
     t_render.start()
 
     try:
-        menu_controle(cp, parar_evento, fila_texto_pub, SALA)
+        menu_controle(cp, parar_evento, fila_texto_pub, sala_ref)
     finally:
         print("\nEncerrando o cliente...")
         parar_evento.set()
